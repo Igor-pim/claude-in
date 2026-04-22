@@ -1,0 +1,55 @@
+services:
+  claude:
+    volumes:
+      # === Editable projects ===
+      # Dual mount: every project needs BOTH container paths.
+      #   /workspace/projects/<name>   Claude context (CLAUDE.md chain)
+      #   ${HOME}/<name>               host-path mirror — required so
+      #                                docker compose's relative paths
+      #                                resolve to real host filesystem
+      #                                paths known to the Docker daemon.
+      #
+      # - ${HOME}/my-project:/workspace/projects/my-project
+      # - ${HOME}/my-project:${HOME}/my-project
+
+      # === Read-only references ===
+      # External services mounted read-only in BOTH locations for safety.
+      #
+      # - ${HOME}/external-service:/workspace/references/external-service:ro
+      # - ${HOME}/external-service:${HOME}/external-service:ro
+
+      # === Personal toolchain caches (opt-in) ===
+      # Only relevant if you actually run language build tools directly
+      # inside claude-box. The default workflow keeps runtimes in each
+      # project's own docker-compose stack and reaches them via
+      # `docker compose exec` — in that case claude-box doesn't need
+      # these caches.
+      #
+      # Mount into /home/dev/... (the container user's home), not ${HOME}
+      # on the container side — that's where language tools look for
+      # dotfiles and caches inside the container.
+      #
+      # --- Java / Kotlin ---
+      # - ${HOME}/.gradle:/home/dev/.gradle
+      # - ${HOME}/.m2:/home/dev/.m2
+      # - ${HOME}/.sdkman:/home/dev/.sdkman
+      #
+      # --- Python ---
+      # - ${HOME}/.cache/pip:/home/dev/.cache/pip
+      # - ${HOME}/.cache/pypoetry:/home/dev/.cache/pypoetry
+      #
+      # --- Node ---
+      # - ${HOME}/.npm:/home/dev/.npm
+      # - ${HOME}/.cache/yarn:/home/dev/.cache/yarn
+      # - ${HOME}/.local/share/pnpm:/home/dev/.local/share/pnpm
+      #
+      # --- Go ---
+      # - ${HOME}/.cache/go-build:/home/dev/.cache/go-build
+      # - ${HOME}/go/pkg/mod:/home/dev/go/pkg/mod
+      #
+      # --- Rust ---
+      # - ${HOME}/.cargo/registry:/home/dev/.cargo/registry
+      # - ${HOME}/.cargo/git:/home/dev/.cargo/git
+      #
+      # --- PHP ---
+      # - ${HOME}/.composer:/home/dev/.composer

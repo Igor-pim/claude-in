@@ -1,0 +1,28 @@
+# Per-user configuration (copy from .example files and customize)
+/CLAUDE.md
+/.mcp.json
+/.container/compose.local.yaml
+
+# Bind-mount targets for user's own projects and references. The tracked
+# _TEMPLATE is the template skeleton; everything else is user content.
+/projects/*
+!/projects/_TEMPLATE/
+
+/references/
+
+# Sandbox worktrees / copies (transient)
+/sandbox/
+
+# Personal scratchpad — local notes, translated docs, anything you want
+# to keep adjacent to the workspace without publishing.
+/_private/
+
+# Claude Code's own state that may leak into the workspace (it auto-creates
+# ./.claude/ if you run `claude` from here before the bind-mount picks it up).
+/.claude/
+
+# IDE / editor
+/.idea/
+/.vscode/
+*.swp
+.DS_Store

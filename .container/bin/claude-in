@@ -1,0 +1,367 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WORKSPACE="${HOME}/workspace"
+SANDBOX_DIR="$WORKSPACE/sandbox"
+META_DIR="$SANDBOX_DIR/.meta"
+CONTAINER="claude-box"
+COMPOSE_DIR="$WORKSPACE/.container"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  claude-in                        Enter /workspace, resume last session
+  claude-in <name>                 Enter projects/<name> or sandbox/<name>, resume
+  claude-in --new [<name>]         Force a new session
+  claude-in --shell [<name>]       Open bash inside the container (debugging)
+
+Sandbox:
+  claude-in --sandbox <project>               Create fresh sandbox (git worktree or copy), enter
+  claude-in --sandbox <project> --continue    Same, but carry the latest session from <project>
+  claude-in --sandbox-list                    List active sandboxes
+  claude-in --sandbox-prune                   Remove sandboxes whose branch is merged into base
+  claude-in --sandbox-remove <name> [--force] Remove a specific sandbox (worktree + branch, or copy)
+
+Maintenance:
+  claude-in --update [--full]      Rebuild image, recreate container
+  claude-in --down                 Stop and remove the container
+  claude-in -h | --help            Show this help
+EOF
+}
+
+# stat -c (GNU) vs stat -f (BSD/macOS). Detect once.
+if stat --version >/dev/null 2>&1; then
+  _stat_gid() { stat -c '%g' "$1"; }
+else
+  _stat_gid() { stat -f '%g' "$1"; }
+fi
+
+# Portable ISO-8601 UTC timestamp (GNU `date -Iseconds` is not on BSD).
+_iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+prep_env() {
+  export USER_UID
+  USER_UID=$(id -u)
+  export USER_GID
+  USER_GID=$(id -g)
+  export DOCKER_GID
+  DOCKER_GID=$(_stat_gid /var/run/docker.sock)
+}
+
+# Docker bind-mounts turn missing source files into directories on the host,
+# which breaks tools that expect regular files. Pre-create the ones we mount.
+ensure_mount_targets() {
+  [ -e "$HOME/.gitconfig" ] || {
+    touch "$HOME/.gitconfig"
+    echo "claude-in: created empty ~/.gitconfig — set identity with:" >&2
+    echo "  git config --global user.name 'Your Name'" >&2
+    echo "  git config --global user.email 'you@example.com'" >&2
+  }
+  [ -e "$HOME/.claude.json" ] || echo '{}' > "$HOME/.claude.json"
+}
+
+# Wrapper: run `docker compose` with base + compose.local.yaml (if present).
+# `cd` into $COMPOSE_DIR so build context and relative -f paths resolve.
+compose() {
+  prep_env
+  local -a files=(-f compose.yaml)
+  [[ -f "$COMPOSE_DIR/compose.local.yaml" ]] && files+=(-f compose.local.yaml)
+  (cd "$COMPOSE_DIR" && docker compose "${files[@]}" "$@")
+}
+
+ensure_running() {
+  if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then return; fi
+  ensure_mount_targets
+  compose up -d
+}
+
+do_update() {
+  local full=0
+  [[ "${1:-}" == "--full" ]] && full=1
+  ensure_mount_targets
+  if [[ $full -eq 1 ]]; then
+    compose build --no-cache --pull
+  else
+    compose build --pull
+  fi
+  compose up -d --force-recreate
+  echo "claude-in: image rebuilt, container recreated."
+}
+
+do_down() {
+  compose down
+}
+
+do_sandbox() {
+  local project="" carry_session=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --continue) carry_session=1; shift ;;
+      -*)         echo "claude-in: --sandbox: unknown flag: $1" >&2; exit 2 ;;
+      *)
+        if [[ -z "$project" ]]; then project="$1"; shift
+        else echo "claude-in: --sandbox takes one project name" >&2; exit 2
+        fi
+        ;;
+    esac
+  done
+  [[ -z "$project" ]] && { echo "claude-in: --sandbox requires a project name (dir under \$HOME)" >&2; exit 2; }
+
+  local src="${HOME}/${project}"
+  [[ -d "$src" ]] || { echo "claude-in: ~/${project} not found on host" >&2; exit 1; }
+
+  mkdir -p "$SANDBOX_DIR" "$META_DIR"
+
+  local timestamp name dest
+  timestamp=$(date +%y%m%d-%H%M)
+  name="${project}-${timestamp}"
+  dest="$SANDBOX_DIR/$name"
+
+  if [[ -e "$dest" ]]; then
+    echo "claude-in: $dest already exists — wait a minute and retry, or prune old sandboxes" >&2
+    exit 1
+  fi
+
+  if git -C "$src" rev-parse --git-dir >/dev/null 2>&1; then
+    local branch base
+    branch="claude/$name"
+    base=$(git -C "$src" rev-parse --abbrev-ref HEAD)
+    git -C "$src" worktree add "$dest" -b "$branch"
+    cat > "$META_DIR/$name.env" <<EOF
+source_repo=$src
+mode=worktree
+branch=$branch
+base_branch=$base
+created=$(_iso_now)
+EOF
+    echo "claude-in: sandbox '$name' — worktree on branch '$branch' (base: $base)"
+  else
+    cp -r "$src" "$dest"
+    cat > "$META_DIR/$name.env" <<EOF
+source_repo=$src
+mode=copy
+created=$(_iso_now)
+EOF
+    echo "claude-in: sandbox '$name' — copied from $src (non-git)"
+    echo "  Merge back manually: diff -r $dest $src"
+  fi
+
+  if [[ $carry_session -eq 1 ]]; then
+    local src_slug dst_slug src_dir dst_dir latest
+    src_slug="-workspace-projects-$project"
+    dst_slug="-workspace-sandbox-$name"
+    src_dir="$HOME/.claude/projects/$src_slug"
+    dst_dir="$HOME/.claude/projects/$dst_slug"
+    if [[ -d "$src_dir" ]] && latest=$(ls -t "$src_dir"/*.jsonl 2>/dev/null | head -1) && [[ -n "$latest" ]]; then
+      mkdir -p "$dst_dir"
+      cp "$latest" "$dst_dir/"
+      echo "claude-in: carried session $(basename "$latest" .jsonl) from $project"
+    else
+      echo "claude-in: --continue set but no prior session for $project, starting fresh"
+    fi
+  fi
+
+  enter_path "/workspace/sandbox/$name"
+}
+
+do_sandbox_list() {
+  shopt -s nullglob
+  local found=0
+  for d in "$SANDBOX_DIR"/*/; do
+    local name
+    name=$(basename "$d")
+    [[ "$name" == ".meta" ]] && continue
+    found=1
+    local meta="$META_DIR/$name.env"
+    if [[ -f "$meta" ]]; then
+      (
+        # shellcheck disable=SC1090
+        . "$meta"
+        printf "  %-50s %s  %s\n" "$name" "${mode:-?}" "${branch:-${source_repo:-?}}"
+      )
+    else
+      printf "  %-50s (no metadata)\n" "$name"
+    fi
+  done
+  [[ $found -eq 0 ]] && echo "No active sandboxes."
+}
+
+do_sandbox_remove() {
+  local force=0
+  local -a names=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--force) force=1; shift ;;
+      -*)         echo "claude-in: --sandbox-remove: unknown flag: $1" >&2; exit 2 ;;
+      *)          names+=("$1"); shift ;;
+    esac
+  done
+  [[ ${#names[@]} -eq 0 ]] && { echo "claude-in: --sandbox-remove requires at least one sandbox name" >&2; exit 2; }
+
+  local dropped=0 kept=0
+  for name in "${names[@]}"; do
+    local dir="$SANDBOX_DIR/$name"
+    local meta="$META_DIR/$name.env"
+
+    if [[ ! -d "$dir" ]]; then
+      echo "skip $name (not found under sandbox/)" >&2
+      kept=$((kept+1))
+      continue
+    fi
+
+    local mode="" source_repo="" branch=""
+    [[ -f "$meta" ]] && {
+      # shellcheck disable=SC1090
+      . "$meta"
+    }
+
+    if [[ "$mode" == "worktree" && -n "$source_repo" ]]; then
+      local -a force_flag=()
+      [[ $force -eq 1 ]] && force_flag=(--force)
+      if git -C "$source_repo" worktree remove "${force_flag[@]}" "$dir" 2>/dev/null; then
+        [[ -n "$branch" ]] && git -C "$source_repo" branch -D "$branch" 2>/dev/null || true
+        rm -f "$meta"
+        echo "removed $name (worktree${branch:+, branch $branch})"
+        dropped=$((dropped+1))
+      else
+        echo "keep $name (dirty or locked — re-run with --force to override)" >&2
+        kept=$((kept+1))
+      fi
+    else
+      # copy mode, no metadata, or stale worktree entry
+      rm -rf "$dir"
+      rm -f "$meta"
+      echo "removed $name (copy/orphan)"
+      dropped=$((dropped+1))
+    fi
+  done
+
+  echo "removed: $dropped, kept: $kept"
+  [[ $kept -gt 0 ]] && exit 1
+  return 0
+}
+
+do_sandbox_prune() {
+  shopt -s nullglob
+  local pruned=0 kept=0
+  for d in "$SANDBOX_DIR"/*/; do
+    local name
+    name=$(basename "$d")
+    [[ "$name" == ".meta" ]] && continue
+
+    local meta="$META_DIR/$name.env"
+    if [[ ! -f "$meta" ]]; then
+      echo "keep $name (no metadata)"
+      kept=$((kept+1))
+      continue
+    fi
+
+    local source_repo="" mode="" branch="" base_branch=""
+    # shellcheck disable=SC1090
+    . "$meta"
+
+    if [[ "$mode" != "worktree" ]]; then
+      echo "keep $name (mode=$mode, manual cleanup needed)"
+      kept=$((kept+1))
+      continue
+    fi
+
+    if git -C "$source_repo" merge-base --is-ancestor "$branch" "$base_branch" 2>/dev/null; then
+      echo "prune $name (branch $branch merged into $base_branch)"
+      git -C "$source_repo" worktree remove "$d" 2>/dev/null || rm -rf "$d"
+      git -C "$source_repo" branch -D "$branch" 2>/dev/null || true
+      rm -f "$meta"
+      pruned=$((pruned+1))
+    else
+      echo "keep $name (branch $branch not merged into $base_branch)"
+      kept=$((kept+1))
+    fi
+  done
+
+  # Clean orphan meta files (worktree already gone)
+  for meta in "$META_DIR"/*.env; do
+    [[ -e "$meta" ]] || continue
+    local name
+    name=$(basename "$meta" .env)
+    if [[ ! -d "$SANDBOX_DIR/$name" ]]; then
+      echo "orphan meta $name.env — removing"
+      rm -f "$meta"
+    fi
+  done
+
+  echo "pruned: $pruned, kept: $kept"
+}
+
+enter_path() {
+  local dir="$1"
+  ensure_running
+
+  local env_args=() claude_extra=()
+  if [[ "$dir" == /workspace/sandbox/* ]]; then
+    local sb_name="${dir#/workspace/sandbox/}"
+    env_args+=(-e "COMPOSE_PROJECT_NAME=$sb_name")
+    claude_extra+=(--permission-mode bypassPermissions)
+  fi
+
+  if [[ "$mode_flag" == "shell" ]]; then
+    docker exec -it "${env_args[@]}" -w "$dir" "$CONTAINER" bash
+    exit 0
+  fi
+
+  local flag=()
+  if [[ "$mode_flag" != "new" ]]; then
+    local slug="${dir//\//-}"
+    if compgen -G "$HOME/.claude/projects/${slug}/*.jsonl" > /dev/null; then
+      flag=(--continue)
+    fi
+  fi
+
+  docker exec -it "${env_args[@]}" -w "$dir" "$CONTAINER" \
+    claude "${claude_extra[@]}" "${flag[@]}" "${claude_args[@]}"
+}
+
+# ---- arg parsing ----
+mode_flag=""
+project=""
+claude_args=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --update)         shift; do_update "$@"; exit 0 ;;
+    --down)           do_down; exit 0 ;;
+    --sandbox)        shift; do_sandbox "$@"; exit 0 ;;
+    --sandbox-list)   do_sandbox_list; exit 0 ;;
+    --sandbox-prune)  do_sandbox_prune; exit 0 ;;
+    --sandbox-remove) shift; do_sandbox_remove "$@"; exit $? ;;
+    --new)            mode_flag="new"; shift ;;
+    --shell)          mode_flag="shell"; shift ;;
+    -h|--help)        usage; exit 0 ;;
+    --)               shift; claude_args+=("$@"); break ;;
+    -*)               echo "claude-in: unknown flag: $1" >&2; usage >&2; exit 2 ;;
+    *)
+      if [[ -z "$project" ]]; then
+        project="$1"
+      else
+        claude_args+=("$1")
+      fi
+      shift
+      ;;
+  esac
+done
+
+ensure_running
+
+dir="/workspace"
+if [[ -n "$project" ]]; then
+  if docker exec "$CONTAINER" test -d "/workspace/projects/$project"; then
+    dir="/workspace/projects/$project"
+  elif docker exec "$CONTAINER" test -d "/workspace/sandbox/$project"; then
+    dir="/workspace/sandbox/$project"
+  else
+    echo "claude-in: '$project' not found in projects/ or sandbox/" >&2
+    docker exec "$CONTAINER" sh -c 'ls /workspace/projects 2>/dev/null; echo; ls /workspace/sandbox 2>/dev/null | grep -v "^\.meta$"' >&2
+    exit 1
+  fi
+fi
+
+enter_path "$dir"

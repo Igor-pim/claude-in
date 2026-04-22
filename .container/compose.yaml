@@ -1,0 +1,41 @@
+services:
+  claude:
+    build:
+      context: .
+      args:
+        USER_UID: "${USER_UID:-1000}"
+        USER_GID: "${USER_GID:-1000}"
+    image: claude-box:latest
+    container_name: claude-box
+    volumes:
+      # Core — always present
+      - ${HOME}/workspace:/workspace
+      - ${HOME}/.claude:/home/dev/.claude
+      - ${HOME}/.claude.json:/home/dev/.claude.json
+      # Git identity for commits made inside the container (:ro — the container
+      # must not mutate the host's global git config).
+      - ${HOME}/.gitconfig:/home/dev/.gitconfig:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Sandbox parent. Dual mount so docker compose inside sandboxes can
+      # resolve relative paths to real host paths (container target matches
+      # host source path). ${HOME} is the HOST user's home — resolved by the
+      # shell that runs `docker compose`.
+      - ${HOME}/workspace/sandbox:/workspace/sandbox
+      - ${HOME}/workspace/sandbox:${HOME}/workspace/sandbox
+    environment:
+      - ANTHROPIC_API_KEY
+      # Host user's home, exposed to Claude inside the container so bash
+      # commands can reference $HOST_HOME/<project> for docker-compose
+      # lifecycle commands regardless of host username.
+      - HOST_HOME=${HOME}
+    group_add:
+      - "${DOCKER_GID:-999}"
+    # host-gateway is resolved by Docker (20.10+) to the host IP. On Docker
+    # Desktop `host.docker.internal` is already provided, but declaring it
+    # here keeps the configuration working on native Linux Docker too.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    restart: unless-stopped

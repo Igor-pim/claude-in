@@ -1,0 +1,58 @@
+# Workspace
+
+This CLAUDE.md is loaded automatically as the parent context for every session started via `claude-in`, whether you enter a project or a sandbox. Keep it as a map of the workspace: which projects exist, how they relate to each other, and the conventions for working here. Details about individual projects belong in their own `CLAUDE.md` under `projects/<name>/`.
+
+## Projects
+
+### Editable
+
+- `projects/<name>/` — <one or two sentences: what it is, prod/dev, main stack>
+
+### References (read-only)
+
+External services, mounted `:ro`. Here to help you understand how your projects interact with them — not to modify.
+
+- `references/<name>/` — <role of the service, who calls it, what it returns>
+
+## Principles
+
+- Project code runs in its own docker-compose stack. Language runtimes are not installed on the host (or in `claude-box`) — every project command goes through `docker compose exec ...`.
+- `git push / pull / fetch` from inside the container do not work and should not. Remote operations stay on the host.
+- Each project keeps its `.env` in its own directory (gitignored). The project's application reads it; the container does not.
+
+## Docker Compose inside the container
+
+Every project is mounted **twice** in `claude-box`:
+
+- `/workspace/projects/<name>/` — for reading and editing (Claude's context, `CLAUDE.md` chain).
+- `$HOST_HOME/<name>/` — the **same** directory, but at the host's filesystem path. The Docker socket talks to the daemon on the host, and the daemon only knows host paths. Relative bind-mounts in a project's own `docker-compose.yml` resolve against the cwd of the `docker compose` process.
+
+**Rule:**
+
+- `docker compose up / down / build / pull / restart` — **always `cd $HOST_HOME/<name>` first**. Otherwise relative paths resolve into `/workspace/...`, the daemon can't find them, and bind-mounts silently break.
+- `docker compose exec / logs / ps / top / stop / start` — cwd doesn't matter; these hit running containers.
+
+Canonical pattern:
+
+```bash
+(cd $HOST_HOME/<name> && docker compose up -d)
+```
+
+Parentheses so Claude's cwd doesn't get stuck in the host mirror.
+
+## Cross-project context
+
+- `shared/` — notes and docs that span more than one project.
+- `claude-in` with no argument — cwd is `/workspace`, every project is visible at once (use for cross-project work).
+- `claude-in <name>` — cwd is `projects/<name>/`; this hub file still loads as a parent.
+
+## Sandbox
+
+- `claude-in --sandbox <project>` creates a git worktree (or, for non-git projects, a `cp -r` copy) under `sandbox/<project>-<YYMMDD-HHMM>/`, and enters it with `--permission-mode bypassPermissions` and `COMPOSE_PROJECT_NAME=<sandbox-name>`.
+- `claude-in --sandbox-list` / `--sandbox-prune` / `--sandbox-remove <name>` — sandbox management. Prune removes merged branches automatically; `--sandbox-remove` targets a specific one (use `--force` for dirty worktrees).
+- Inside a sandbox, the host-path mirror is `$HOST_HOME/workspace/sandbox/<name>/`. Lifecycle compose commands:
+  ```bash
+  (cd $HOST_HOME/workspace/sandbox/<name> && docker compose up -d)
+  ```
+- Accept changes — `git merge claude/<sandbox-name>` in the source repo.
+- Full details — see `README.md`.
