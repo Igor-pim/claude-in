@@ -394,4 +394,6 @@ You need to recreate the container (`--force-recreate`), which `claude-in --upda
 
 ## License
 
-TBD — pick one (MIT and Apache-2.0 are both common for dev tooling).
+MIT — see [LICENSE](LICENSE).
+
+Not affiliated with Anthropic. "Claude" is a trademark of Anthropic, used here nominatively to identify the product this tool wraps.
