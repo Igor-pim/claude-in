@@ -2,6 +2,7 @@
 /CLAUDE.md
 /.mcp.json
 /.container/compose.local.yaml
+/tmp/*
 
 # Bind-mount targets for user's own projects and references. The tracked
 # _TEMPLATE is the template skeleton; everything else is user content.

@@ -16,11 +16,12 @@ Usage:
   claude-in --shell [<name>]       Open bash inside the container (debugging)
 
 Sandbox:
-  claude-in --sandbox <project>               Create fresh sandbox (git worktree or copy), enter
-  claude-in --sandbox <project> --continue    Same, but carry the latest session from <project>
-  claude-in --sandbox-list                    List active sandboxes
-  claude-in --sandbox-prune                   Remove sandboxes whose branch is merged into base
-  claude-in --sandbox-remove <name> [--force] Remove a specific sandbox (worktree + branch, or copy)
+  claude-in --sandbox <project>                     Create fresh sandbox (git worktree or copy), enter
+  claude-in --sandbox <project> --continue          Same, but carry the latest session from <project>
+  claude-in --sandbox <project> --isolated-claude   Ephemeral ~/.claude — host memory/plugins/auth out of reach
+  claude-in --sandbox-list                          List active sandboxes
+  claude-in --sandbox-prune                         Remove sandboxes whose branch is merged into base
+  claude-in --sandbox-remove <name> [--force]       Remove a specific sandbox (worktree + branch, or copy)
 
 Maintenance:
   claude-in --update [--full]      Rebuild image, recreate container
@@ -93,11 +94,12 @@ do_down() {
 }
 
 do_sandbox() {
-  local project="" carry_session=0
+  local project="" carry_session=0 isolated_claude=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --continue) carry_session=1; shift ;;
-      -*)         echo "claude-in: --sandbox: unknown flag: $1" >&2; exit 2 ;;
+      --continue)         carry_session=1; shift ;;
+      --isolated-claude)  isolated_claude=1; shift ;;
+      -*)                 echo "claude-in: --sandbox: unknown flag: $1" >&2; exit 2 ;;
       *)
         if [[ -z "$project" ]]; then project="$1"; shift
         else echo "claude-in: --sandbox takes one project name" >&2; exit 2
@@ -106,9 +108,30 @@ do_sandbox() {
     esac
   done
   [[ -z "$project" ]] && { echo "claude-in: --sandbox requires a project name (dir under \$HOME)" >&2; exit 2; }
+  if [[ $carry_session -eq 1 && $isolated_claude -eq 1 ]]; then
+    echo "claude-in: --continue and --isolated-claude are mutually exclusive" >&2
+    echo "  isolated mode starts with a fresh HOME — no session to carry into" >&2
+    exit 2
+  fi
 
   local src="${HOME}/${project}"
   [[ -d "$src" ]] || { echo "claude-in: ~/${project} not found on host" >&2; exit 1; }
+
+  # For git projects, the worktree's .git pointer references a host path
+  # ($src/.git/worktrees/<name>/). If $src isn't bind-mounted into the
+  # container, that path won't resolve and `git` inside will fail. Catch it
+  # here rather than after the worktree is already on disk.
+  if git -C "$src" rev-parse --git-dir >/dev/null 2>&1; then
+    ensure_running
+    if ! docker exec "$CONTAINER" test -d "$src"; then
+      echo "claude-in: --sandbox: '$src' is not mounted inside $CONTAINER" >&2
+      echo "  add to ${COMPOSE_DIR##*/}/compose.local.yaml under volumes:" >&2
+      echo "    - \${HOME}/${project}:/workspace/projects/${project}" >&2
+      echo "    - \${HOME}/${project}:\${HOME}/${project}" >&2
+      echo "  then run: claude-in --update" >&2
+      exit 1
+    fi
+  fi
 
   mkdir -p "$SANDBOX_DIR" "$META_DIR"
 
@@ -146,6 +169,15 @@ EOF
     echo "  Merge back manually: diff -r $dest $src"
   fi
 
+  if [[ $isolated_claude -eq 1 ]]; then
+    local iso_home="$META_DIR/$name-home"
+    mkdir -p "$iso_home/.claude"
+    echo '{}' > "$iso_home/.claude.json"
+    [[ -f "$HOME/.gitconfig" ]] && cp "$HOME/.gitconfig" "$iso_home/.gitconfig"
+    echo "isolated_claude=1" >> "$META_DIR/$name.env"
+    echo "claude-in: isolated-claude — host ~/.claude/ unreachable; memory/plugins/login unavailable"
+  fi
+
   if [[ $carry_session -eq 1 ]]; then
     local src_slug dst_slug src_dir dst_dir latest
     src_slug="-workspace-projects-$project"
@@ -177,7 +209,9 @@ do_sandbox_list() {
       (
         # shellcheck disable=SC1090
         . "$meta"
-        printf "  %-50s %s  %s\n" "$name" "${mode:-?}" "${branch:-${source_repo:-?}}"
+        local iso_tag=""
+        [[ "${isolated_claude:-0}" == "1" ]] && iso_tag=" [isolated]"
+        printf "  %-50s %s  %s%s\n" "$name" "${mode:-?}" "${branch:-${source_repo:-?}}" "$iso_tag"
       )
     else
       printf "  %-50s (no metadata)\n" "$name"
@@ -202,10 +236,19 @@ do_sandbox_remove() {
   for name in "${names[@]}"; do
     local dir="$SANDBOX_DIR/$name"
     local meta="$META_DIR/$name.env"
+    local iso_home="$META_DIR/$name-home"
 
+    # Sandbox dir gone but leftovers in .meta/ — clean those up instead of bailing.
     if [[ ! -d "$dir" ]]; then
-      echo "skip $name (not found under sandbox/)" >&2
-      kept=$((kept+1))
+      if [[ -f "$meta" || -d "$iso_home" ]]; then
+        rm -f "$meta"
+        [[ -d "$iso_home" ]] && rm -rf "$iso_home"
+        echo "removed $name (orphan meta — sandbox dir already gone)"
+        dropped=$((dropped+1))
+      else
+        echo "skip $name (not found under sandbox/)" >&2
+        kept=$((kept+1))
+      fi
       continue
     fi
 
@@ -215,25 +258,68 @@ do_sandbox_remove() {
       . "$meta"
     }
 
-    if [[ "$mode" == "worktree" && -n "$source_repo" ]]; then
+    # Worktree path: only delegate to git if the worktree is still registered
+    # in the source repo. A "stale" entry (on disk but not in `git worktree list`)
+    # falls through to the rm -rf path below.
+    if [[ "$mode" == "worktree" && -n "$source_repo" ]] \
+        && git -C "$source_repo" rev-parse --git-dir >/dev/null 2>&1 \
+        && git -C "$source_repo" worktree list --porcelain 2>/dev/null \
+            | grep -Fxq "worktree $dir"; then
       local -a force_flag=()
       [[ $force -eq 1 ]] && force_flag=(--force)
-      if git -C "$source_repo" worktree remove "${force_flag[@]}" "$dir" 2>/dev/null; then
+      local git_err
+      if git_err=$(git -C "$source_repo" worktree remove "${force_flag[@]}" "$dir" 2>&1); then
         [[ -n "$branch" ]] && git -C "$source_repo" branch -D "$branch" 2>/dev/null || true
         rm -f "$meta"
+        [[ -d "$iso_home" ]] && rm -rf "$iso_home"
         echo "removed $name (worktree${branch:+, branch $branch})"
         dropped=$((dropped+1))
-      else
-        echo "keep $name (dirty or locked — re-run with --force to override)" >&2
-        kept=$((kept+1))
+        continue
       fi
-    else
-      # copy mode, no metadata, or stale worktree entry
-      rm -rf "$dir"
-      rm -f "$meta"
-      echo "removed $name (copy/orphan)"
-      dropped=$((dropped+1))
+      if [[ $force -eq 0 ]]; then
+        echo "keep $name (git: ${git_err##*$'\n'} — try --force)" >&2
+      else
+        echo "keep $name (git worktree remove --force: ${git_err##*$'\n'})" >&2
+      fi
+      kept=$((kept+1))
+      continue
     fi
+
+    # Copy mode, stale worktree, or no metadata: just rm the directory.
+    # Files inside may be owned by root (created by docker compose under root),
+    # which the host user can't unlink — fall back to `docker exec -u 0` then.
+    local rm_err=""
+    if ! rm_err=$(rm -rf "$dir" 2>&1) || [[ -e "$dir" ]]; then
+      if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER"; then
+        docker exec -u 0 "$CONTAINER" rm -rf "/workspace/sandbox/$name" >/dev/null 2>&1 || true
+      fi
+      if [[ -e "$dir" ]]; then
+        if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER"; then
+          echo "keep $name (rm failed even via $CONTAINER as root): ${rm_err:-unknown error}" >&2
+        else
+          echo "keep $name (rm failed; start $CONTAINER and retry to fall back to root): ${rm_err:-unknown error}" >&2
+        fi
+        kept=$((kept+1))
+        continue
+      fi
+    fi
+
+    # Stale worktree leftovers: branch may still linger and the registry needs pruning.
+    if [[ "$mode" == "worktree" && -n "$source_repo" ]] \
+        && git -C "$source_repo" rev-parse --git-dir >/dev/null 2>&1; then
+      [[ -n "$branch" ]] && git -C "$source_repo" branch -D "$branch" 2>/dev/null || true
+      git -C "$source_repo" worktree prune 2>/dev/null || true
+    fi
+
+    rm -f "$meta"
+    [[ -d "$iso_home" ]] && rm -rf "$iso_home"
+
+    case "$mode" in
+      worktree) echo "removed $name (stale worktree${branch:+, branch $branch})" ;;
+      copy)     echo "removed $name (copy)" ;;
+      *)        echo "removed $name (orphan)" ;;
+    esac
+    dropped=$((dropped+1))
   done
 
   echo "removed: $dropped, kept: $kept"
@@ -271,6 +357,7 @@ do_sandbox_prune() {
       git -C "$source_repo" worktree remove "$d" 2>/dev/null || rm -rf "$d"
       git -C "$source_repo" branch -D "$branch" 2>/dev/null || true
       rm -f "$meta"
+      [[ -d "$META_DIR/$name-home" ]] && rm -rf "$META_DIR/$name-home"
       pruned=$((pruned+1))
     else
       echo "keep $name (branch $branch not merged into $base_branch)"
@@ -289,6 +376,17 @@ do_sandbox_prune() {
     fi
   done
 
+  # Clean orphan iso-home dirs (sandbox dir gone but iso-home left)
+  for iso_dir in "$META_DIR"/*-home; do
+    [[ -d "$iso_dir" ]] || continue
+    local iso_name
+    iso_name=$(basename "$iso_dir" -home)
+    if [[ ! -d "$SANDBOX_DIR/$iso_name" ]]; then
+      echo "orphan iso-home $iso_name-home — removing"
+      rm -rf "$iso_dir"
+    fi
+  done
+
   echo "pruned: $pruned, kept: $kept"
 }
 
@@ -296,11 +394,22 @@ enter_path() {
   local dir="$1"
   ensure_running
 
-  local env_args=() claude_extra=()
+  local env_args=() claude_extra=() iso_home="" sb_name=""
   if [[ "$dir" == /workspace/sandbox/* ]]; then
-    local sb_name="${dir#/workspace/sandbox/}"
+    sb_name="${dir#/workspace/sandbox/}"
     env_args+=(-e "COMPOSE_PROJECT_NAME=$sb_name")
     claude_extra+=(--permission-mode bypassPermissions)
+
+    local meta="$META_DIR/$sb_name.env"
+    if [[ -f "$meta" ]]; then
+      local isolated_claude=""
+      # shellcheck disable=SC1090
+      . "$meta"
+      if [[ "${isolated_claude:-0}" == "1" ]]; then
+        iso_home="/workspace/sandbox/.meta/$sb_name-home"
+        env_args+=(-e "HOME=$iso_home")
+      fi
+    fi
   fi
 
   if [[ "$mode_flag" == "shell" ]]; then
@@ -311,7 +420,11 @@ enter_path() {
   local flag=()
   if [[ "$mode_flag" != "new" ]]; then
     local slug="${dir//\//-}"
-    if compgen -G "$HOME/.claude/projects/${slug}/*.jsonl" > /dev/null; then
+    local sessions_root="$HOME/.claude"
+    if [[ -n "$iso_home" ]]; then
+      sessions_root="$HOME/workspace/sandbox/.meta/$sb_name-home/.claude"
+    fi
+    if compgen -G "$sessions_root/projects/${slug}/*.jsonl" > /dev/null; then
       flag=(--continue)
     fi
   fi

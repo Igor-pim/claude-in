@@ -7,7 +7,15 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git jq less ripgrep gnupg sudo \
+      sox libsox-fmt-pulse libsox-fmt-alsa pulseaudio-utils \
+      alsa-utils libasound2-plugins \
     && rm -rf /var/lib/apt/lists/*
+
+# Route ALSA default PCM through PulseAudio so `arecord` and `sox -d` work
+# without explicit `-t pulseaudio`. Claude Code's voice mode shells out to
+# either tool; with this + PULSE_SERVER=unix:/mnt/wslg/PulseServer it picks
+# up the WSLg microphone on Windows 11.
+RUN printf 'pcm.!default { type pulse }\nctl.!default { type pulse }\n' > /etc/asound.conf
 
 # Node.js 20 (for Claude Code)
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \

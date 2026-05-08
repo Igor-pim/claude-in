@@ -53,3 +53,14 @@ services:
       #
       # --- PHP ---
       # - ${HOME}/.composer:/home/dev/.composer
+
+      # === WSLg audio (microphone for /voice) ===
+      # Windows 11 + WSL2 + WSLg exposes PulseAudio at /mnt/wslg/PulseServer.
+      # Mount the socket and point PULSE_SERVER at it. Skip both lines on
+      # native Linux or Windows 10 — /mnt/wslg won't exist there.
+      #
+      # - /mnt/wslg:/mnt/wslg
+      #
+      # And in environment: (uncomment the block, not just the line)
+      # environment:
+      #   - PULSE_SERVER=unix:/mnt/wslg/PulseServer

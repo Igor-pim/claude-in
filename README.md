@@ -99,6 +99,7 @@ Docker builds the image (2–5 min on first run), starts `claude-box`, and drops
 | ------------------------------------------------ | ------ |
 | `claude-in --sandbox <project>`                  | Create a fresh sandbox from `~/<project>`, enter it with `bypassPermissions`. |
 | `claude-in --sandbox <project> --continue`       | Same, but carry the most recent session from `projects/<project>`. |
+| `claude-in --sandbox <project> --isolated-claude`| Same, but with an ephemeral `~/.claude/` scoped to this sandbox — host memory, plugins, skills, and login stay out of reach. Mutually exclusive with `--continue`. |
 | `claude-in --sandbox-list`                       | List active sandboxes. |
 | `claude-in --sandbox-prune`                      | Remove sandboxes whose branch has been merged into its base. |
 | `claude-in --sandbox-remove <name> [--force]`    | Remove a specific sandbox. Worktrees with uncommitted changes need `--force`. |
@@ -183,6 +184,28 @@ What happens:
 
 If the project isn't a git repo, the wrapper falls back to `cp -r` (mode=copy). Review is then by hand (`diff -r`, `rsync`).
 
+### Isolated-claude mode
+
+Add `--isolated-claude` to sandbox creation:
+
+```bash
+claude-in --sandbox my-api --isolated-claude
+```
+
+The wrapper swaps `HOME` inside the container to an ephemeral directory scoped to this sandbox (`sandbox/.meta/<name>-home/`), so Claude Code reads and writes `.claude/` relative to that — your host `~/.claude/` is untouched.
+
+Tradeoffs:
+
+- **No host memory** — `MEMORY.md` and everything under `~/.claude/memory/` is unavailable.
+- **No host plugins or skills** — fresh install, only what ships with Claude Code itself.
+- **No host settings or hooks** — starts with defaults.
+- **No OAuth login carry-over** — set `ANTHROPIC_API_KEY` in your shell so it flows through the env, or log in inside the isolated session.
+- **Ephemeral sessions** — they live in `sandbox/.meta/<name>-home/.claude/` and vanish with `--sandbox-remove`.
+
+`--isolated-claude` is mutually exclusive with `--continue` — the isolated HOME is empty, so there's no session to carry in. Resuming an isolated sandbox (`claude-in <sandbox-name>`) is auto-detected from its metadata — don't repeat the flag.
+
+Fit: when a sandbox pulls in code you haven't audited (an external branch, a CI artifact). Doesn't eliminate the `/var/run/docker.sock` attack surface — see **Security** below.
+
 ### Work
 
 Claude does whatever it needs inside the sandbox. To bring up the project stack:
@@ -229,7 +252,7 @@ claude-in --sandbox-remove <name> --force      # override git's dirty-tree safet
 - **Host ports** — production and sandbox stacks that want the same port will conflict. Stop production first, or add a `docker-compose.override.yml` in the worktree with different ports.
 - **Named volumes** — prefixed by `COMPOSE_PROJECT_NAME` (so they're separate), but they start empty. If you need production data, dump and restore manually.
 - **External APIs** — real (Jira, Confluence, third-party). Sandbox doesn't proxy.
-- **`~/.claude/`** — shared across the whole workspace. `bypassPermissions` means Claude could in theory edit its own state there.
+- **`~/.claude/` (default)** — shared across the whole workspace. `bypassPermissions` means Claude could in theory edit its own state there. Pass `--isolated-claude` at sandbox creation to swap in an ephemeral `.claude/` scoped to that sandbox.
 - **`/workspace/CLAUDE.md`** (the hub) — outside the worktree; edits apply to the real hub.
 
 ---
@@ -248,6 +271,7 @@ Mitigations built into the design:
 - **`COMPOSE_PROJECT_NAME` isolation** — sandbox stacks don't collide with production by default.
 - **No SSH keys mounted** — local `git commit` works; `git push`/`pull` do not.
 - **No ingress** — the container only exposes what Docker Desktop does (nothing by default, unless you add port mappings).
+- **`--isolated-claude` for sandboxes** — ephemeral `HOME` swap keeps host `~/.claude/` (memory, plugins, login, settings) out of reach of the sandbox agent.
 
 If you need stricter isolation, run separate `claude-box` instances per project, each with its own `container_name` and image name — the current design uses a single shared container.
 
@@ -374,7 +398,7 @@ You need to recreate the container (`--force-recreate`), which `claude-in --upda
 ## Known limitations
 
 - **No `git push`/`pull` from inside** — intentional. SSH keys aren't mounted. Claude can `git commit` locally; pushing is on you.
-- **`~/.claude/` is shared** with host Claude sessions. Convenient (resume on either side) but in `bypassPermissions` mode nothing stops Claude from writing to it.
+- **`~/.claude/` is shared by default** with host Claude sessions — convenient (resume on either side) but in `bypassPermissions` mode nothing stops Claude from writing to it. Use `--isolated-claude` on sandbox creation if you want that mount out of the way for a specific session.
 - **Auto-memory slug per cwd.** Each sandbox has its own memory slug — memory collected there vanishes with `--sandbox-prune`. Move the relevant files manually before pruning if you care.
 - **One `claude-box` per host.** Running parallel instances with different environments would need different `container_name` and image names in compose.yaml; not supported out of the box.
 
