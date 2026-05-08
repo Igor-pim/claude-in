@@ -56,3 +56,9 @@ Parentheses so Claude's cwd doesn't get stuck in the host mirror.
   ```
 - Accept changes — `git merge claude/<sandbox-name>` in the source repo.
 - Full details — see `README.md`.
+
+## Autonomous mode
+
+- `claude-auto <project> <jira-key> [--rounds N]` runs an unattended dev → review loop on top of a sandbox. Both agents are headless `claude -p` sessions inside `claude-box`; reviewer emits `VERDICT: PASS|FAIL` and the loop iterates up to `--rounds` (default 3, max 4). Beta — review the diff before merging.
+- Logs and prompts land under `~/workspace/sandbox/.meta/<sandbox-name>-auto/`; the sandbox itself behaves like any other (cleanup via `claude-in --sandbox-remove`).
+- Full details — see `README.md`.

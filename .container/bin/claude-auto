@@ -1,0 +1,482 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# claude-auto — autonomous dev → review loop inside claude-box.
+#
+# Both agents run via `claude -p` headless inside the existing `claude-box`
+# container. Both agents run with bypassPermissions — headless mode can't ask
+# for per-tool permission interactively, so the default mode would block any
+# MCP tool call (including jira). Reviewer doesn't write much in practice;
+# tighter allowlists are tracked as a follow-up.
+#
+# Sandbox is left in place after the run for human inspection / final merge.
+# The existing `claude-in --sandbox …` flow is untouched.
+
+WORKSPACE="${HOME}/workspace"
+SANDBOX_DIR="$WORKSPACE/sandbox"
+META_DIR="$SANDBOX_DIR/.meta"
+CONTAINER="claude-box"
+
+DEFAULT_ROUNDS=3
+MAX_ROUNDS=4
+
+usage() {
+  cat <<'EOF'
+Usage:
+  claude-auto <project> <jira-key> [--rounds N] [--name NAME]
+
+Run an autonomous dev → review loop inside claude-box.
+
+Arguments:
+  <project>       Directory under $HOME (must be bind-mounted in claude-box,
+                  same constraint as `claude-in --sandbox`).
+  <jira-key>      Jira issue key (e.g. PROJ-1234). Both agents fetch it via
+                  the jira MCP server inside the container.
+
+Options:
+  --rounds N      Max review rounds (1..4, default 3). On VERDICT: PASS the
+                  loop exits early.
+  --name NAME     Custom sandbox name (default <project>-<YYMMDD-HHMM>-auto).
+  -h, --help      Show this help.
+
+Layout:
+  ~/workspace/sandbox/<name>/                  fresh git worktree (or copy)
+  ~/workspace/sandbox/.meta/<name>.env         sandbox metadata (claude-in compatible)
+  ~/workspace/sandbox/.meta/<name>-auto/       per-round prompts, logs, session ids
+    round-<N>-dev.{prompt.txt,log}
+    round-<N>-review.{prompt.txt,log}
+    session-ids.env
+
+After the run:
+  PASS — sandbox is left in place; review the diff and `git merge claude/<name>`
+         from the project repo when ready.
+  FAIL — sandbox is left in place; continue manually with `claude-in <name>`.
+
+Cleanup is the same as for any sandbox:
+  claude-in --sandbox-remove <name> [--force]
+EOF
+}
+
+# ----- helpers -----
+
+_iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+gen_uuid() {
+  if [[ -r /proc/sys/kernel/random/uuid ]]; then
+    cat /proc/sys/kernel/random/uuid
+  elif command -v uuidgen >/dev/null 2>&1; then
+    uuidgen
+  else
+    echo "claude-auto: cannot generate UUID (no /proc/sys/kernel/random/uuid, no uuidgen)" >&2
+    exit 1
+  fi
+}
+
+ensure_running() {
+  if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
+    echo "claude-auto: $CONTAINER is not running. Start it first: claude-in" >&2
+    exit 1
+  fi
+}
+
+# ----- sandbox creation (mirrors claude-in's do_sandbox, sans enter_path) -----
+
+create_sandbox() {
+  local project="$1" custom_name="$2"
+  local src="${HOME}/${project}"
+
+  [[ -d "$src" ]] || { echo "claude-auto: ~/${project} not found on host" >&2; exit 1; }
+
+  if git -C "$src" rev-parse --git-dir >/dev/null 2>&1; then
+    if ! docker exec "$CONTAINER" test -d "$src"; then
+      cat >&2 <<EOF
+claude-auto: '$src' is not bind-mounted inside $CONTAINER.
+  Worktree's .git pointer would reference an unreachable host path.
+  Add to .container/compose.local.yaml under volumes:
+    - \${HOME}/${project}:/workspace/projects/${project}
+    - \${HOME}/${project}:\${HOME}/${project}
+  then run: claude-in --update
+EOF
+      exit 1
+    fi
+  fi
+
+  mkdir -p "$SANDBOX_DIR" "$META_DIR"
+
+  local name dest
+  if [[ -n "$custom_name" ]]; then
+    name="$custom_name"
+  else
+    name="${project}-$(date +%y%m%d-%H%M)-auto"
+  fi
+  dest="$SANDBOX_DIR/$name"
+  [[ -e "$dest" ]] && { echo "claude-auto: $dest already exists — pick another --name or wait a minute" >&2; exit 1; }
+
+  if git -C "$src" rev-parse --git-dir >/dev/null 2>&1; then
+    local branch base
+    branch="claude/$name"
+    base=$(git -C "$src" rev-parse --abbrev-ref HEAD)
+    git -C "$src" worktree add "$dest" -b "$branch" >&2
+    cat > "$META_DIR/$name.env" <<EOF
+source_repo=$src
+mode=worktree
+branch=$branch
+base_branch=$base
+created=$(_iso_now)
+auto=1
+EOF
+    echo "claude-auto: sandbox '$name' — worktree on '$branch' (base: $base)" >&2
+  else
+    cp -r "$src" "$dest"
+    cat > "$META_DIR/$name.env" <<EOF
+source_repo=$src
+mode=copy
+created=$(_iso_now)
+auto=1
+EOF
+    echo "claude-auto: sandbox '$name' — copy of $src (non-git, manual review only)" >&2
+  fi
+
+  printf '%s\n' "$name"
+}
+
+# ----- prompt builders -----
+
+dev_prompt_initial() {
+  local jira_key="$1" branch="$2" base="$3"
+  cat <<EOF
+Реализуй задачу из Jira \`$jira_key\`.
+
+Шаги:
+1. Прочти задачу через инструмент \`mcp__jira__jira_get_issue\` (issue_key=$jira_key) — описание, acceptance criteria, все поля.
+2. Если в задаче есть ссылки на Confluence — открой их через \`mcp__jira__confluence_get_page\` и учти.
+3. Реализуй изменения в текущем рабочем каталоге. Это git worktree, рабочая ветка \`$branch\`, база \`$base\`.
+4. Закоммить локально (по одному коммиту на смысловую единицу). Пушить не нужно.
+5. В конце ответа кратко перечисли, что сделал.
+
+Если что-то по постановке непонятно — зафиксируй открытый вопрос в выводе и реализуй наиболее разумный вариант.
+EOF
+}
+
+dev_prompt_round() {
+  local feedback="$1"
+  cat <<EOF
+Ревьюер вернул замечания после предыдущего раунда:
+
+---
+$feedback
+---
+
+Учти их, исправь код в этом же worktree, закоммить новый коммит. В конце вывода кратко перечисли, что изменил.
+EOF
+}
+
+review_prompt_initial() {
+  local jira_key="$1" branch="$2" base="$3"
+  cat <<EOF
+Ты — независимый ревьюер. Постановка задачи: Jira \`$jira_key\`. Прочти её и связанные Confluence-страницы через инструменты \`mcp__jira__jira_get_issue\` (issue_key=$jira_key) и \`mcp__jira__confluence_get_page\`.
+
+Реализация лежит в ветке \`$branch\` (sandbox worktree). База — \`$base\`. Текущий рабочий каталог — основной checkout проекта; ветка \`$branch\` видна в git как обычная локальная ветка.
+
+Шаги:
+1. Изучи изменения через Bash: \`git log --oneline $base..$branch\`, \`git diff --stat $base..$branch\`, далее \`git diff $base..$branch <конкретный путь>\` для важных мест.
+2. Сравни реализацию с постановкой:
+   - Все ли требования и acceptance criteria покрыты.
+   - Нет ли регрессий за пределами scope-а задачи.
+   - Качество: тесты, обработка ошибок, edge cases, безопасность, читаемость.
+3. Заверши вывод СТРОГО на отдельной последней строке одним из двух вариантов:
+   - \`VERDICT: PASS\` — если изменения готовы к merge.
+   - \`VERDICT: FAIL\` — если есть критичные замечания.
+4. Если FAIL — после строки verdict выведи нумерованный список actionable замечаний для разработчика. Конкретно: что и где править. Без воды и общих фраз.
+
+Никакого текста после verdict-строки и списка замечаний.
+EOF
+}
+
+review_prompt_round() {
+  local branch="$1"
+  cat <<EOF
+Разработчик добавил коммиты к ветке \`$branch\` после твоих замечаний. Проверь свежие изменения:
+1. Посмотри новые коммиты через Bash: \`git log --oneline $branch\` и diff последних коммитов.
+2. По каждому пункту своих предыдущих замечаний — учтено или нет.
+
+Тот же формат: на отдельной последней строке \`VERDICT: PASS\` или \`VERDICT: FAIL\`, плюс новый нумерованный список замечаний для FAIL.
+EOF
+}
+
+review_prompt_strict_retry() {
+  cat <<EOF
+В предыдущем ответе ты не выдал ожидаемый verdict-трейлер. Без него автоматизация не работает.
+
+Перечитай свой предыдущий анализ и заверши вывод СТРОГО на отдельной последней строке:
+- \`VERDICT: PASS\` если изменения готовы к merge.
+- \`VERDICT: FAIL\` если есть критичные замечания (после этой строки — нумерованный список).
+
+Ничего после verdict-строки и списка не пиши.
+EOF
+}
+
+# ----- runners -----
+
+# Render one stream-json event into a human-readable line.
+# Skipped event types fall through to `empty` and produce no output.
+# `[init …]` and `[done: …]` are framing markers added by us; the model's text
+# content passes through verbatim, which keeps the VERDICT trailer parseable.
+STREAM_JQ_FILTER='
+  if .type == "system" and .subtype == "init" then
+    "[init session=\(.session_id // "?") cwd=\(.cwd // "?") mcp=\([.mcp_servers[]? | select(.status == "connected") | .name] | join(","))]"
+  elif .type == "assistant" then
+    (.message.content // [])[]? |
+      if .type == "text" then
+        .text
+      elif .type == "tool_use" then
+        (.input //{}|
+          if      has("file_path")  then "file_path=\(.file_path)"
+          elif    has("command")    then "cmd=\(.command | tostring | .[0:120])"
+          elif    has("path")       then "path=\(.path)"
+          elif    has("pattern")    then "pattern=\(.pattern)"
+          elif    has("issue_key")  then "issue_key=\(.issue_key)"
+          elif    has("page_id")    then "page_id=\(.page_id)"
+          elif    has("query")      then "query=\(.query | tostring | .[0:80])"
+          elif    has("jql")        then "jql=\(.jql | tostring | .[0:80])"
+          else (. | tostring | .[0:80]) end) as $arg |
+        "  -> \(.name)(\($arg))"
+      else empty end
+  elif .type == "user" then
+    (.message.content // [])[]? |
+      if .type == "tool_result" then
+        if (.is_error // false) then "     [tool error]" else "     [ok]" end
+      else empty end
+  elif .type == "result" then
+    "[done: \(.subtype // "?") cost=$\(.total_cost_usd // 0) duration_ms=\(.duration_ms // 0)]"
+  else empty end
+'
+
+# Args: cwd_in_container, session_id, is_first_round, prompt_path_in_container, log_path_on_host, [bypass_perms]
+# Streams claude in real time:
+#   stdout = jq-formatted human lines (also tee'd to <log_path>).
+#   <log_path>.jsonl = raw stream-json events (for debugging or post-hoc analysis).
+# Pipeline runs entirely inside claude-box (jq lives there, not on host).
+# Host-side `tee` captures the formatted stream as the user sees it.
+run_claude() {
+  local cwd="$1" sid="$2" first="$3" prompt_path="$4" log_path="$5" bypass="${6:-0}"
+
+  local sess_arg
+  if [[ "$first" -eq 1 ]]; then
+    sess_arg="--session-id $sid"
+  else
+    sess_arg="--resume $sid"
+  fi
+
+  local perm_arg=""
+  [[ "$bypass" -eq 1 ]] && perm_arg="--permission-mode bypassPermissions"
+
+  local raw_log_host="${log_path%.log}.jsonl"
+  local raw_log_cont="/workspace${raw_log_host#$WORKSPACE}"
+
+  # Pipeline inside container: claude → tee raw → jq formatter.
+  # PIPESTATUS lets us return claude's exit code, ignoring tee/jq fluctuations.
+  set +e
+  docker exec -i \
+    -w "$cwd" \
+    -e "STREAM_JQ_FILTER=$STREAM_JQ_FILTER" \
+    -e "AUTO_PROMPT=$prompt_path" \
+    -e "AUTO_RAW=$raw_log_cont" \
+    -e "AUTO_SESS=$sess_arg" \
+    -e "AUTO_PERM=$perm_arg" \
+    "$CONTAINER" \
+    bash -c '
+      stdbuf -oL claude -p $AUTO_SESS $AUTO_PERM --output-format stream-json --verbose < "$AUTO_PROMPT" \
+        | stdbuf -oL tee "$AUTO_RAW" \
+        | jq --unbuffered -r "$STREAM_JQ_FILTER"
+    ' | tee "$log_path"
+  local pipe_status=("${PIPESTATUS[@]}")
+  set -e
+
+  return "${pipe_status[0]}"
+}
+
+# ----- verdict parsing -----
+
+parse_verdict() {
+  local log_file="$1"
+  local last
+  last=$(grep -E '^VERDICT: (PASS|FAIL)$' "$log_file" | tail -1 || true)
+  case "$last" in
+    "VERDICT: PASS") echo "PASS" ;;
+    "VERDICT: FAIL") echo "FAIL" ;;
+    *)               echo "UNKNOWN" ;;
+  esac
+}
+
+extract_feedback() {
+  # Everything after the LAST 'VERDICT: FAIL' line, minus our framing markers.
+  local log_file="$1"
+  local last_line
+  last_line=$(grep -nE '^VERDICT: FAIL$' "$log_file" | tail -1 | cut -d: -f1)
+  if [[ -n "$last_line" ]]; then
+    tail -n +$((last_line + 1)) "$log_file" | grep -vE '^\[(init|done:)'
+  fi
+}
+
+# ----- main -----
+
+main() {
+  local project="" jira_key="" rounds="$DEFAULT_ROUNDS" custom_name=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --rounds)  shift; [[ $# -gt 0 ]] || { echo "claude-auto: --rounds needs a value" >&2; exit 2; }
+                 rounds="$1"; shift ;;
+      --name)    shift; [[ $# -gt 0 ]] || { echo "claude-auto: --name needs a value" >&2; exit 2; }
+                 custom_name="$1"; shift ;;
+      -h|--help) usage; exit 0 ;;
+      -*)        echo "claude-auto: unknown flag: $1" >&2; usage >&2; exit 2 ;;
+      *)
+        if   [[ -z "$project"  ]]; then project="$1"
+        elif [[ -z "$jira_key" ]]; then jira_key="$1"
+        else echo "claude-auto: too many positional args: $1" >&2; exit 2
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [[ -z "$project" || -z "$jira_key" ]] && { usage >&2; exit 2; }
+  [[ "$rounds" =~ ^[1-9][0-9]*$ ]] || { echo "claude-auto: --rounds must be a positive integer" >&2; exit 2; }
+  if [[ "$rounds" -gt "$MAX_ROUNDS" ]]; then
+    echo "claude-auto: --rounds $rounds exceeds cap $MAX_ROUNDS — refusing (cost guard)" >&2
+    exit 2
+  fi
+
+  ensure_running
+
+  local name
+  name=$(create_sandbox "$project" "$custom_name")
+
+  # Read sandbox metadata.
+  local meta="$META_DIR/${name}.env"
+  local source_repo="" mode="" branch="" base_branch=""
+  # shellcheck disable=SC1090
+  . "$meta"
+
+  if [[ "$mode" != "worktree" ]]; then
+    echo "claude-auto: non-git project (mode=$mode) — review can't diff against a base branch" >&2
+    echo "claude-auto: aborting. For non-git projects, use the manual flow." >&2
+    exit 1
+  fi
+
+  local auto_dir="$META_DIR/${name}-auto"
+  mkdir -p "$auto_dir"
+
+  local dev_sid review_sid
+  dev_sid=$(gen_uuid)
+  review_sid=$(gen_uuid)
+  cat > "$auto_dir/session-ids.env" <<EOF
+dev_session_id=$dev_sid
+review_session_id=$review_sid
+project=$project
+jira_key=$jira_key
+created=$(_iso_now)
+EOF
+
+  local sandbox_cwd="/workspace/sandbox/$name"
+  local project_cwd="/workspace/projects/$project"
+  local prompt_dir_in_container="/workspace/sandbox/.meta/${name}-auto"
+
+  echo "claude-auto: ===== run start: $project / $jira_key — up to $rounds round(s) =====" >&2
+
+  local r feedback="" verdict
+  for ((r=1; r<=rounds; r++)); do
+    echo "" >&2
+    echo "claude-auto: ----- round $r/$rounds -----" >&2
+
+    # ---------- DEV ----------
+    local dev_prompt_host="$auto_dir/round-${r}-dev.prompt.txt"
+    local dev_prompt_cont="$prompt_dir_in_container/round-${r}-dev.prompt.txt"
+    local dev_log="$auto_dir/round-${r}-dev.log"
+
+    if [[ "$r" -eq 1 ]]; then
+      dev_prompt_initial "$jira_key" "$branch" "$base_branch" > "$dev_prompt_host"
+    else
+      dev_prompt_round "$feedback" > "$dev_prompt_host"
+    fi
+
+    echo "claude-auto: dev round $r — start $(_iso_now)" >&2
+    if ! run_claude "$sandbox_cwd" "$dev_sid" "$([[ $r -eq 1 ]] && echo 1 || echo 0)" \
+                    "$dev_prompt_cont" "$dev_log" 1; then
+      echo "claude-auto: dev round $r — non-zero exit. Sandbox: $SANDBOX_DIR/$name" >&2
+      exit 1
+    fi
+    echo "claude-auto: dev round $r — done  $(_iso_now)" >&2
+
+    local dev_commits
+    dev_commits=$(git -C "$SANDBOX_DIR/$name" rev-list --count "$base_branch..HEAD" 2>/dev/null || echo "?")
+    echo "claude-auto: dev round $r — $dev_commits commit(s) on $branch" >&2
+
+    # ---------- REVIEW ----------
+    local rev_prompt_host="$auto_dir/round-${r}-review.prompt.txt"
+    local rev_prompt_cont="$prompt_dir_in_container/round-${r}-review.prompt.txt"
+    local rev_log="$auto_dir/round-${r}-review.log"
+
+    if [[ "$r" -eq 1 ]]; then
+      review_prompt_initial "$jira_key" "$branch" "$base_branch" > "$rev_prompt_host"
+    else
+      review_prompt_round "$branch" > "$rev_prompt_host"
+    fi
+
+    echo "claude-auto: review round $r — start $(_iso_now)" >&2
+    if ! run_claude "$project_cwd" "$review_sid" "$([[ $r -eq 1 ]] && echo 1 || echo 0)" \
+                    "$rev_prompt_cont" "$rev_log" 1; then
+      echo "claude-auto: review round $r — non-zero exit. Sandbox: $SANDBOX_DIR/$name" >&2
+      exit 1
+    fi
+    echo "claude-auto: review round $r — done  $(_iso_now)" >&2
+
+    verdict=$(parse_verdict "$rev_log")
+
+    # On UNKNOWN, retry review once with strict reminder, same session.
+    if [[ "$verdict" == "UNKNOWN" ]]; then
+      echo "claude-auto: review round $r — verdict not parseable, retrying with strict reminder" >&2
+      local retry_prompt_host="$auto_dir/round-${r}-review-retry.prompt.txt"
+      local retry_prompt_cont="$prompt_dir_in_container/round-${r}-review-retry.prompt.txt"
+      local retry_log="$auto_dir/round-${r}-review-retry.log"
+      review_prompt_strict_retry > "$retry_prompt_host"
+      run_claude "$project_cwd" "$review_sid" 0 "$retry_prompt_cont" "$retry_log" 1 || true
+      verdict=$(parse_verdict "$retry_log")
+      [[ "$verdict" == "FAIL" ]] && rev_log="$retry_log"
+    fi
+
+    echo "claude-auto: round $r verdict: $verdict" >&2
+
+    case "$verdict" in
+      PASS)
+        echo "" >&2
+        echo "claude-auto: ===== PASS in $r round(s) =====" >&2
+        echo "claude-auto: branch:  $branch" >&2
+        echo "claude-auto: sandbox: $SANDBOX_DIR/$name" >&2
+        echo "claude-auto: review and merge into $base_branch when ready" >&2
+        return 0
+        ;;
+      FAIL)
+        feedback=$(extract_feedback "$rev_log")
+        if [[ -z "$feedback" ]]; then
+          echo "claude-auto: review FAIL with no feedback body — aborting" >&2
+          exit 1
+        fi
+        ;;
+      UNKNOWN)
+        echo "claude-auto: review still didn't emit verdict on retry — aborting" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  echo "" >&2
+  echo "claude-auto: ===== no PASS after $rounds rounds =====" >&2
+  echo "claude-auto: sandbox: $SANDBOX_DIR/$name" >&2
+  echo "claude-auto: continue manually: claude-in $name" >&2
+  return 1
+}
+
+main "$@"

@@ -104,6 +104,13 @@ Docker builds the image (2–5 min on first run), starts `claude-box`, and drops
 | `claude-in --sandbox-prune`                      | Remove sandboxes whose branch has been merged into its base. |
 | `claude-in --sandbox-remove <name> [--force]`    | Remove a specific sandbox. Worktrees with uncommitted changes need `--force`. |
 
+### Autonomous commands
+
+| Command                                          | Effect |
+| ------------------------------------------------ | ------ |
+| `claude-auto <project> <jira-key> [--rounds N]`  | Unattended dev → review loop driven by a Jira ticket. Beta — see [Autonomous mode](#autonomous-mode-claude-auto). |
+| `claude-auto --help`                             | Show all flags. |
+
 ---
 
 ## Adding a project
@@ -274,6 +281,95 @@ Mitigations built into the design:
 - **`--isolated-claude` for sandboxes** — ephemeral `HOME` swap keeps host `~/.claude/` (memory, plugins, login, settings) out of reach of the sandbox agent.
 
 If you need stricter isolation, run separate `claude-box` instances per project, each with its own `container_name` and image name — the current design uses a single shared container.
+
+---
+
+## Autonomous mode (`claude-auto`)
+
+Run a dev → review loop end-to-end with no human in the iteration. Built on top of the sandbox infrastructure: a fresh worktree, two headless Claude Code sessions, structured handoff via a `VERDICT: PASS|FAIL` trailer, up to 4 rounds. **Beta** — has been smoke-tested but not battle-hardened; treat the diff as untrusted and review before merging.
+
+### When it fits
+
+- Task is well-described in a Jira ticket (with linked Confluence specs if needed). Both agents fetch it via the jira MCP — the orchestrator stays MCP-free.
+- You want to start the run, walk away, and come back to either a green merge candidate or a sandbox you can continue manually.
+- Acceptance is testable from code (functional spec, contracts, expected output). Open-ended refactors and exploratory work fit the manual flow better.
+
+### Run
+
+```bash
+claude-auto <project> <jira-key> [--rounds N=3] [--name NAME]
+```
+
+Example:
+
+```bash
+claude-auto my-api PROJ-1234 --rounds 3
+```
+
+What happens:
+
+1. **Sandbox creation.** Fresh git worktree on branch `claude/<sandbox-name>` from the current branch of `~/<project>`. Same constraint as `claude-in --sandbox`: the project must be bind-mounted into `claude-box`.
+2. **Round 1 — dev.** Headless `claude -p` runs in the sandbox cwd with `--permission-mode bypassPermissions`. The prompt instructs it to read the Jira ticket via `mcp__jira__jira_get_issue`, follow Confluence links via `mcp__jira__confluence_get_page`, implement the change, and commit locally.
+3. **Round 1 — review.** A separate headless session runs in `/workspace/projects/<project>` (the project's main checkout). It reads the diff against the base branch via Bash, compares against the spec, and ends its output with `VERDICT: PASS` or `VERDICT: FAIL` plus an actionable list.
+4. On `PASS` — exit 0, sandbox left in place for human merge.
+5. On `FAIL` — feedback feeds into dev's next round (resumed via `--resume <session-uuid>`), then review again. Loop repeats up to `--rounds`.
+
+Both agents run **inside `claude-box`**, just in different cwds. They use distinct session IDs (`--session-id <uuid>` / `--resume <uuid>`) so neither collides with your normal interactive sessions in the same project dir.
+
+### What you see in the terminal
+
+The stream is line-buffered and human-readable:
+
+```
+[init session=<uuid> cwd=/workspace/sandbox/<name> mcp=jira]
+  -> mcp__jira__jira_get_issue(issue_key=PROJ-1234)
+     [ok]
+  -> Bash(cmd=git diff develop..HEAD)
+     [ok]
+The change splits the unit-dependent reference book by …
+…
+VERDICT: PASS
+[done: success cost=$1.85 duration_ms=276351]
+```
+
+`-> Tool(arg)` is a tool call; `[ok]` / `[tool error]` is the result. Model text passes through verbatim. The trailing `[done:]` reports total cost and wall time for that round.
+
+### Output layout
+
+```
+~/workspace/sandbox/<name>/                            sandbox worktree
+~/workspace/sandbox/.meta/<name>.env                   sandbox metadata (claude-in compatible)
+~/workspace/sandbox/.meta/<name>-auto/
+├── session-ids.env                                    dev + reviewer session UUIDs, project, jira_key
+├── round-<N>-dev.prompt.txt                           prompt sent to dev
+├── round-<N>-dev.log                                  formatted human-readable stream
+├── round-<N>-dev.jsonl                                raw stream-json events
+├── round-<N>-review.prompt.txt
+├── round-<N>-review.log
+└── round-<N>-review.jsonl
+```
+
+`*.log` mirrors what you saw in the terminal. `*.jsonl` has full event-level detail (per-turn token usage, model, tool inputs/outputs) — useful for cost analysis and post-hoc debugging.
+
+### After the run
+
+- **PASS:** review the diff in `~/workspace/sandbox/<name>/` and `git merge claude/<name>` into the base branch when satisfied. Same workflow as for any sandbox.
+- **FAIL after `--rounds`:** continue manually with `claude-in <name>` to enter the sandbox; the dev session is resumable, so Claude remembers everything from the auto run.
+
+Cleanup goes through the normal sandbox path:
+
+```bash
+claude-in --sandbox-remove <name>          # targeted
+claude-in --sandbox-prune                  # bulk: remove merged sandboxes
+```
+
+### Caveats
+
+- **Cost.** Each round runs two long headless sessions. Real tasks observed at ~$5–10 per dev pass and ~$1–3 per reviewer pass on Opus. Watch the `[done: cost=...]` markers; cap with `--rounds 1` for cheap dry runs.
+- **`bypassPermissions` for both agents.** Headless mode can't ask for per-tool permission interactively, so the default mode would block any MCP call (and a lot of useful Bash). Reviewer doesn't write much in practice, but it can — review the diff before merging. Tighter allowlists via `--allowedTools` are tracked as a follow-up.
+- **Verdict discipline.** The reviewer is instructed to end with a strict trailer. If it forgets, `claude-auto` retries the review pass once with a stricter reminder, same session. If the trailer is still missing, the run aborts with a clear error rather than guessing.
+- **Non-git projects.** Only git projects work — review needs `git diff <base>..<branch>`. For copy-mode projects, use the manual sandbox flow.
+- **Project-specific runtimes.** Dev runs inside `claude-box`, which is deliberately thin (no PHP, Python, JDK baked in). For commands that need a project runtime, dev should use `docker compose exec <service> <cmd>` from `$HOST_HOME/<project>` — same convention as a normal sandbox session.
 
 ---
 
