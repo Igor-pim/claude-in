@@ -23,29 +23,47 @@ MAX_ROUNDS=4
 usage() {
   cat <<'EOF'
 Usage:
-  claude-auto <project> <jira-key> [--rounds N] [--name NAME]
+  claude-auto <project> [<jira-key>] [task-source ...] [--rounds N] [--name NAME]
 
-Run an autonomous dev → review loop inside claude-box.
+Run an autonomous dev → review loop inside claude-box. The task is composed
+from one or more sources (mix freely; at least one is required).
 
 Arguments:
-  <project>       Directory under $HOME (must be bind-mounted in claude-box,
-                  same constraint as `claude-in --sandbox`).
-  <jira-key>      Jira issue key (e.g. PROJ-1234). Both agents fetch it via
-                  the jira MCP server inside the container.
+  <project>           Directory under $HOME (must be bind-mounted in claude-box,
+                      same constraint as `claude-in --sandbox`).
+  <jira-key>          Optional 2nd positional, back-compat shorthand for --jira.
+
+Task sources (combinable; at least one required):
+  --jira KEY          Jira issue. Repeatable: --jira PROJ-1 --jira PROJ-2.
+                      Both agents fetch via mcp__jira__jira_get_issue.
+  --confluence ID     Confluence page id. Repeatable.
+                      Both agents fetch via mcp__jira__confluence_get_page.
+  --prompt "TEXT"     Inline free-form task description.
+  --prompt-file PATH  Read task description from a file. PATH = '-' reads stdin.
+                      Mutually exclusive with --prompt.
 
 Options:
-  --rounds N      Max review rounds (1..4, default 3). On VERDICT: PASS the
-                  loop exits early.
-  --name NAME     Custom sandbox name (default <project>-<YYMMDD-HHMM>-auto).
-  -h, --help      Show this help.
+  --rounds N          Max review rounds (1..4, default 3). On VERDICT: PASS the
+                      loop exits early.
+  --name NAME         Custom sandbox name (default <project>-<YYMMDD-HHMM>-auto).
+  -h, --help          Show this help.
+
+Examples:
+  claude-auto my-api PROJ-1234                              # back-compat shorthand
+  claude-auto my-api --jira PROJ-1234 --rounds 4
+  claude-auto my-api --jira PROJ-1 --jira PROJ-2 --confluence 671980720
+  claude-auto my-api --prompt "Add /healthz endpoint returning {status:ok}"
+  claude-auto my-api --jira PROJ-1234 --prompt "Reuse the existing helper instead of writing a new one."
+  echo "Refactor X..." | claude-auto my-api --prompt-file -
 
 Layout:
   ~/workspace/sandbox/<name>/                  fresh git worktree (or copy)
   ~/workspace/sandbox/.meta/<name>.env         sandbox metadata (claude-in compatible)
   ~/workspace/sandbox/.meta/<name>-auto/       per-round prompts, logs, session ids
-    round-<N>-dev.{prompt.txt,log}
-    round-<N>-review.{prompt.txt,log}
-    session-ids.env
+    session-ids.env                            sources + UUIDs
+    inline-prompt.txt                          resolved --prompt / --prompt-file content (if any)
+    round-<N>-dev.{prompt.txt,log,jsonl}
+    round-<N>-review.{prompt.txt,log,jsonl}
 
 After the run:
   PASS — sandbox is left in place; review the diff and `git merge claude/<name>`
@@ -142,17 +160,45 @@ EOF
 
 # ----- prompt builders -----
 
+# Module-level state populated by main() before the prompt builders run.
+TASK_JIRA_KEYS=()
+TASK_CONFLUENCE_PAGES=()
+TASK_PROMPT_BLOCK=""
+
+# Render task sources as labeled blocks. Output goes to stdout (from a heredoc
+# substitution). Empty sources are skipped, so the resulting prompt contains
+# only the blocks that were actually requested.
+emit_source_blocks() {
+  if (( ${#TASK_JIRA_KEYS[@]} > 0 )); then
+    printf '\n== Jira ==\n'
+    printf 'Прочти каждую задачу через `mcp__jira__jira_get_issue` (включая поля description, acceptance criteria, комментарии):\n'
+    local k
+    for k in "${TASK_JIRA_KEYS[@]}"; do printf -- '- %s\n' "$k"; done
+  fi
+  if (( ${#TASK_CONFLUENCE_PAGES[@]} > 0 )); then
+    printf '\n== Confluence ==\n'
+    printf 'Прочти каждую страницу через `mcp__jira__confluence_get_page`:\n'
+    local p
+    for p in "${TASK_CONFLUENCE_PAGES[@]}"; do printf -- '- %s\n' "$p"; done
+  fi
+  if [[ -n "$TASK_PROMPT_BLOCK" ]]; then
+    printf '\n== Дополнительные инструкции ==\n'
+    printf '%s\n' "$TASK_PROMPT_BLOCK"
+  fi
+}
+
 dev_prompt_initial() {
-  local jira_key="$1" branch="$2" base="$3"
+  local branch="$1" base="$2"
   cat <<EOF
-Реализуй задачу из Jira \`$jira_key\`.
+Реализуй задачу в текущем рабочем каталоге. Это git worktree, рабочая ветка \`$branch\`, база \`$base\`.
+
+Источники постановки:
+$(emit_source_blocks)
 
 Шаги:
-1. Прочти задачу через инструмент \`mcp__jira__jira_get_issue\` (issue_key=$jira_key) — описание, acceptance criteria, все поля.
-2. Если в задаче есть ссылки на Confluence — открой их через \`mcp__jira__confluence_get_page\` и учти.
-3. Реализуй изменения в текущем рабочем каталоге. Это git worktree, рабочая ветка \`$branch\`, база \`$base\`.
-4. Закоммить локально (по одному коммиту на смысловую единицу). Пушить не нужно.
-5. В конце ответа кратко перечисли, что сделал.
+1. Прочти все источники выше до начала работы (Jira/Confluence — через MCP-инструменты, Дополнительные инструкции — как текст).
+2. Реализуй изменения. Закоммить локально по одному коммиту на смысловую единицу. Пушить не нужно.
+3. В конце ответа кратко перечисли, что сделал.
 
 Если что-то по постановке непонятно — зафиксируй открытый вопрос в выводе и реализуй наиболее разумный вариант.
 EOF
@@ -172,22 +218,24 @@ EOF
 }
 
 review_prompt_initial() {
-  local jira_key="$1" branch="$2" base="$3"
+  local branch="$1" base="$2"
   cat <<EOF
-Ты — независимый ревьюер. Постановка задачи: Jira \`$jira_key\`. Прочти её и связанные Confluence-страницы через инструменты \`mcp__jira__jira_get_issue\` (issue_key=$jira_key) и \`mcp__jira__confluence_get_page\`.
+Ты — независимый ревьюер. Источники постановки задачи:
+$(emit_source_blocks)
 
 Реализация лежит в ветке \`$branch\` (sandbox worktree). База — \`$base\`. Текущий рабочий каталог — основной checkout проекта; ветка \`$branch\` видна в git как обычная локальная ветка.
 
 Шаги:
-1. Изучи изменения через Bash: \`git log --oneline $base..$branch\`, \`git diff --stat $base..$branch\`, далее \`git diff $base..$branch <конкретный путь>\` для важных мест.
-2. Сравни реализацию с постановкой:
-   - Все ли требования и acceptance criteria покрыты.
+1. Прочти все источники постановки выше (Jira/Confluence — через MCP, Дополнительные инструкции — как текст).
+2. Изучи изменения через Bash: \`git log --oneline $base..$branch\`, \`git diff --stat $base..$branch\`, далее \`git diff $base..$branch <конкретный путь>\` для важных мест.
+3. Сравни реализацию со ВСЕМИ источниками постановки:
+   - Все ли требования / acceptance criteria покрыты.
    - Нет ли регрессий за пределами scope-а задачи.
    - Качество: тесты, обработка ошибок, edge cases, безопасность, читаемость.
-3. Заверши вывод СТРОГО на отдельной последней строке одним из двух вариантов:
+4. Заверши вывод СТРОГО на отдельной последней строке одним из двух вариантов:
    - \`VERDICT: PASS\` — если изменения готовы к merge.
    - \`VERDICT: FAIL\` — если есть критичные замечания.
-4. Если FAIL — после строки verdict выведи нумерованный список actionable замечаний для разработчика. Конкретно: что и где править. Без воды и общих фраз.
+5. Если FAIL — после строки verdict выведи нумерованный список actionable замечаний для разработчика. Конкретно: что и где править. Без воды и общих фраз.
 
 Никакого текста после verdict-строки и списка замечаний.
 EOF
@@ -322,19 +370,30 @@ extract_feedback() {
 # ----- main -----
 
 main() {
-  local project="" jira_key="" rounds="$DEFAULT_ROUNDS" custom_name=""
+  local project="" rounds="$DEFAULT_ROUNDS" custom_name=""
+  local prompt_inline="" prompt_file=""
+  local positional_count=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --rounds)  shift; [[ $# -gt 0 ]] || { echo "claude-auto: --rounds needs a value" >&2; exit 2; }
-                 rounds="$1"; shift ;;
-      --name)    shift; [[ $# -gt 0 ]] || { echo "claude-auto: --name needs a value" >&2; exit 2; }
-                 custom_name="$1"; shift ;;
-      -h|--help) usage; exit 0 ;;
-      -*)        echo "claude-auto: unknown flag: $1" >&2; usage >&2; exit 2 ;;
+      --rounds)        shift; [[ $# -gt 0 ]] || { echo "claude-auto: --rounds needs a value" >&2; exit 2; }
+                       rounds="$1"; shift ;;
+      --name)          shift; [[ $# -gt 0 ]] || { echo "claude-auto: --name needs a value" >&2; exit 2; }
+                       custom_name="$1"; shift ;;
+      --jira)          shift; [[ $# -gt 0 ]] || { echo "claude-auto: --jira needs a value" >&2; exit 2; }
+                       TASK_JIRA_KEYS+=("$1"); shift ;;
+      --confluence)    shift; [[ $# -gt 0 ]] || { echo "claude-auto: --confluence needs a value" >&2; exit 2; }
+                       TASK_CONFLUENCE_PAGES+=("$1"); shift ;;
+      --prompt)        shift; [[ $# -gt 0 ]] || { echo "claude-auto: --prompt needs a value" >&2; exit 2; }
+                       prompt_inline="$1"; shift ;;
+      --prompt-file)   shift; [[ $# -gt 0 ]] || { echo "claude-auto: --prompt-file needs a value" >&2; exit 2; }
+                       prompt_file="$1"; shift ;;
+      -h|--help)       usage; exit 0 ;;
+      -*)              echo "claude-auto: unknown flag: $1" >&2; usage >&2; exit 2 ;;
       *)
-        if   [[ -z "$project"  ]]; then project="$1"
-        elif [[ -z "$jira_key" ]]; then jira_key="$1"
+        positional_count=$((positional_count + 1))
+        if   [[ "$positional_count" -eq 1 ]]; then project="$1"
+        elif [[ "$positional_count" -eq 2 ]]; then TASK_JIRA_KEYS+=("$1")
         else echo "claude-auto: too many positional args: $1" >&2; exit 2
         fi
         shift
@@ -342,7 +401,43 @@ main() {
     esac
   done
 
-  [[ -z "$project" || -z "$jira_key" ]] && { usage >&2; exit 2; }
+  [[ -z "$project" ]] && { usage >&2; exit 2; }
+
+  if [[ -n "$prompt_inline" && -n "$prompt_file" ]]; then
+    echo "claude-auto: --prompt and --prompt-file are mutually exclusive" >&2
+    exit 2
+  fi
+
+  # Resolve --prompt / --prompt-file into TASK_PROMPT_BLOCK.
+  if [[ -n "$prompt_inline" ]]; then
+    TASK_PROMPT_BLOCK="$prompt_inline"
+  elif [[ -n "$prompt_file" ]]; then
+    if [[ "$prompt_file" == "-" ]]; then
+      if [[ -t 0 ]]; then
+        echo "claude-auto: --prompt-file - requires stdin to be piped (got a terminal)" >&2
+        exit 2
+      fi
+      TASK_PROMPT_BLOCK=$(cat)
+    elif [[ -f "$prompt_file" ]]; then
+      TASK_PROMPT_BLOCK=$(cat "$prompt_file")
+    else
+      echo "claude-auto: --prompt-file '$prompt_file' not found" >&2
+      exit 1
+    fi
+    [[ -z "$TASK_PROMPT_BLOCK" ]] && {
+      echo "claude-auto: --prompt-file resolved to empty content" >&2
+      exit 2
+    }
+  fi
+
+  if (( ${#TASK_JIRA_KEYS[@]} == 0 )) \
+       && (( ${#TASK_CONFLUENCE_PAGES[@]} == 0 )) \
+       && [[ -z "$TASK_PROMPT_BLOCK" ]]; then
+    echo "claude-auto: no task source provided — need at least one of --jira / --confluence / --prompt / --prompt-file (or 2nd positional jira-key)" >&2
+    usage >&2
+    exit 2
+  fi
+
   [[ "$rounds" =~ ^[1-9][0-9]*$ ]] || { echo "claude-auto: --rounds must be a positive integer" >&2; exit 2; }
   if [[ "$rounds" -gt "$MAX_ROUNDS" ]]; then
     echo "claude-auto: --rounds $rounds exceeds cap $MAX_ROUNDS — refusing (cost guard)" >&2
@@ -372,19 +467,38 @@ main() {
   local dev_sid review_sid
   dev_sid=$(gen_uuid)
   review_sid=$(gen_uuid)
+
+  # Comma-joined source lists for traceability. Empty fields indicate "none".
+  local jira_csv="" conf_csv=""
+  (( ${#TASK_JIRA_KEYS[@]} > 0 ))        && jira_csv=$(IFS=,; printf '%s' "${TASK_JIRA_KEYS[*]}")
+  (( ${#TASK_CONFLUENCE_PAGES[@]} > 0 )) && conf_csv=$(IFS=,; printf '%s' "${TASK_CONFLUENCE_PAGES[*]}")
+
   cat > "$auto_dir/session-ids.env" <<EOF
+project=$project
+jira_keys=$jira_csv
+confluence_pages=$conf_csv
+has_prompt=$([[ -n "$TASK_PROMPT_BLOCK" ]] && echo 1 || echo 0)
 dev_session_id=$dev_sid
 review_session_id=$review_sid
-project=$project
-jira_key=$jira_key
 created=$(_iso_now)
 EOF
+
+  if [[ -n "$TASK_PROMPT_BLOCK" ]]; then
+    printf '%s\n' "$TASK_PROMPT_BLOCK" > "$auto_dir/inline-prompt.txt"
+  fi
 
   local sandbox_cwd="/workspace/sandbox/$name"
   local project_cwd="/workspace/projects/$project"
   local prompt_dir_in_container="/workspace/sandbox/.meta/${name}-auto"
 
-  echo "claude-auto: ===== run start: $project / $jira_key — up to $rounds round(s) =====" >&2
+  # Build a short summary of the task sources for the run-start banner.
+  local source_summary_parts=()
+  (( ${#TASK_JIRA_KEYS[@]} > 0 ))        && source_summary_parts+=("jira:$jira_csv")
+  (( ${#TASK_CONFLUENCE_PAGES[@]} > 0 )) && source_summary_parts+=("confluence:$conf_csv")
+  [[ -n "$TASK_PROMPT_BLOCK" ]]          && source_summary_parts+=("prompt:${#TASK_PROMPT_BLOCK}ch")
+  local source_summary=$(IFS=' '; printf '%s' "${source_summary_parts[*]}")
+
+  echo "claude-auto: ===== run start: $project / $source_summary — up to $rounds round(s) =====" >&2
 
   local r feedback="" verdict
   for ((r=1; r<=rounds; r++)); do
@@ -397,7 +511,7 @@ EOF
     local dev_log="$auto_dir/round-${r}-dev.log"
 
     if [[ "$r" -eq 1 ]]; then
-      dev_prompt_initial "$jira_key" "$branch" "$base_branch" > "$dev_prompt_host"
+      dev_prompt_initial "$branch" "$base_branch" > "$dev_prompt_host"
     else
       dev_prompt_round "$feedback" > "$dev_prompt_host"
     fi
@@ -420,7 +534,7 @@ EOF
     local rev_log="$auto_dir/round-${r}-review.log"
 
     if [[ "$r" -eq 1 ]]; then
-      review_prompt_initial "$jira_key" "$branch" "$base_branch" > "$rev_prompt_host"
+      review_prompt_initial "$branch" "$base_branch" > "$rev_prompt_host"
     else
       review_prompt_round "$branch" > "$rev_prompt_host"
     fi

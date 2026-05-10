@@ -108,7 +108,7 @@ Docker builds the image (2–5 min on first run), starts `claude-box`, and drops
 
 | Command                                          | Effect |
 | ------------------------------------------------ | ------ |
-| `claude-auto <project> <jira-key> [--rounds N]`  | Unattended dev → review loop driven by a Jira ticket. Beta — see [Autonomous mode](#autonomous-mode-claude-auto). |
+| `claude-auto <project> <task-source ...>`        | Unattended dev → review loop. Task is composed from one or more sources: Jira ticket(s), Confluence page(s), inline prompt, or file. Beta — see [Autonomous mode](#autonomous-mode-claude-auto). |
 | `claude-auto --help`                             | Show all flags. |
 
 ---
@@ -290,27 +290,52 @@ Run a dev → review loop end-to-end with no human in the iteration. Built on to
 
 ### When it fits
 
-- Task is well-described in a Jira ticket (with linked Confluence specs if needed). Both agents fetch it via the jira MCP — the orchestrator stays MCP-free.
+- Task is well-defined: a Jira ticket, a Confluence spec, a written brief, or any combination. Both agents fetch external sources via the jira MCP — the orchestrator stays MCP-free and just composes the prompt.
 - You want to start the run, walk away, and come back to either a green merge candidate or a sandbox you can continue manually.
 - Acceptance is testable from code (functional spec, contracts, expected output). Open-ended refactors and exploratory work fit the manual flow better.
 
 ### Run
 
 ```bash
-claude-auto <project> <jira-key> [--rounds N=3] [--name NAME]
+claude-auto <project> [<jira-key>] [task-source ...] [--rounds N=3] [--name NAME]
 ```
 
-Example:
+Task sources are combinable; **at least one is required**:
+
+| Source | Flag | Repeatable | What the agents do with it |
+| ------ | ---- | ---------- | --------------------------- |
+| Jira issue | `--jira KEY` | yes | fetch via `mcp__jira__jira_get_issue` |
+| Confluence page | `--confluence PAGE_ID` | yes | fetch via `mcp__jira__confluence_get_page` |
+| Inline brief | `--prompt "TEXT"` | no | included verbatim in the prompt |
+| File brief | `--prompt-file PATH` (`-` = stdin) | no | included verbatim; mutually exclusive with `--prompt` |
+
+Back-compat: the 2nd positional argument is still accepted as a Jira key, equivalent to `--jira <key>`.
+
+Examples:
 
 ```bash
-claude-auto my-api PROJ-1234 --rounds 3
+# Single Jira ticket (back-compat shorthand)
+claude-auto my-api PROJ-1234
+
+# Multiple Jira tickets + a Confluence spec
+claude-auto my-api --jira PROJ-1 --jira PROJ-2 --confluence 671980720
+
+# Free-form brief (no Jira at all)
+claude-auto my-api --prompt "Add /healthz endpoint returning {status: ok}"
+
+# Hybrid — ticket plus extra constraints
+claude-auto my-api --jira PROJ-1234 --prompt "Reuse the existing helper instead of writing a new one."
+
+# Long brief from a file or piped in
+claude-auto my-api --prompt-file ./task.md
+echo "Refactor X..." | claude-auto my-api --prompt-file -
 ```
 
 What happens:
 
 1. **Sandbox creation.** Fresh git worktree on branch `claude/<sandbox-name>` from the current branch of `~/<project>`. Same constraint as `claude-in --sandbox`: the project must be bind-mounted into `claude-box`.
-2. **Round 1 — dev.** Headless `claude -p` runs in the sandbox cwd with `--permission-mode bypassPermissions`. The prompt instructs it to read the Jira ticket via `mcp__jira__jira_get_issue`, follow Confluence links via `mcp__jira__confluence_get_page`, implement the change, and commit locally.
-3. **Round 1 — review.** A separate headless session runs in `/workspace/projects/<project>` (the project's main checkout). It reads the diff against the base branch via Bash, compares against the spec, and ends its output with `VERDICT: PASS` or `VERDICT: FAIL` plus an actionable list.
+2. **Round 1 — dev.** Headless `claude -p` runs in the sandbox cwd with `--permission-mode bypassPermissions`. The composed prompt has each task source as a labeled section (`== Jira ==`, `== Confluence ==`, `== Дополнительные инструкции ==`); the agent reads them all, implements the change, and commits locally.
+3. **Round 1 — review.** A separate headless session runs in `/workspace/projects/<project>` (the project's main checkout). It receives the same source blocks plus the base branch reference, reads the diff via Bash, compares the implementation against every source, and ends its output with `VERDICT: PASS` or `VERDICT: FAIL` plus an actionable list.
 4. On `PASS` — exit 0, sandbox left in place for human merge.
 5. On `FAIL` — feedback feeds into dev's next round (resumed via `--resume <session-uuid>`), then review again. Loop repeats up to `--rounds`.
 
@@ -340,8 +365,9 @@ VERDICT: PASS
 ~/workspace/sandbox/<name>/                            sandbox worktree
 ~/workspace/sandbox/.meta/<name>.env                   sandbox metadata (claude-in compatible)
 ~/workspace/sandbox/.meta/<name>-auto/
-├── session-ids.env                                    dev + reviewer session UUIDs, project, jira_key
-├── round-<N>-dev.prompt.txt                           prompt sent to dev
+├── session-ids.env                                    project, sources, dev + reviewer UUIDs, timestamp
+├── inline-prompt.txt                                  resolved --prompt / --prompt-file content (if any)
+├── round-<N>-dev.prompt.txt                           prompt sent to dev (composed source blocks + steps)
 ├── round-<N>-dev.log                                  formatted human-readable stream
 ├── round-<N>-dev.jsonl                                raw stream-json events
 ├── round-<N>-review.prompt.txt
