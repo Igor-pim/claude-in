@@ -108,7 +108,7 @@ Docker builds the image (2–5 min on first run), starts `claude-box`, and drops
 
 | Command                                          | Effect |
 | ------------------------------------------------ | ------ |
-| `claude-auto <project> <task-source ...>`        | Unattended dev → review loop. Task is composed from one or more sources: Jira ticket(s), Confluence page(s), inline prompt, or file. Beta — see [Autonomous mode](#autonomous-mode-claude-auto). |
+| `claude-auto <project> <task-source ...> [--stand]` | Unattended dev → review loop. Task is composed from Jira ticket(s), Confluence page(s), inline prompt, or file. `--stand` adds a live docker compose stack the reviewer (and dev rounds 2+) can hit. Beta — see [Autonomous mode](#autonomous-mode-claude-auto). |
 | `claude-auto --help`                             | Show all flags. |
 
 ---
@@ -389,9 +389,34 @@ claude-in --sandbox-remove <name>          # targeted
 claude-in --sandbox-prune                  # bulk: remove merged sandboxes
 ```
 
+### Live review stand (`--stand`)
+
+Add `--stand` to bring up the project's `docker-compose.yml` inside the sandbox, isolated from the production stack. The reviewer (and dev rounds 2+) get a port table in their prompt and can `curl` endpoints, `docker exec` into services, read logs — anything you'd do manually to behaviorally validate a change.
+
+How it works:
+
+1. **Before any rounds run**, claude-auto inspects the sandbox's `docker-compose.yml` via `docker compose config --format json` and generates a per-sandbox override file (`<auto-dir>/docker-compose.review-stand.yml`) that remaps every published port to `0` (Docker assigns a free host port). This avoids collisions with the production stack on the same host.
+2. **After dev round 1**, the orchestrator runs `<auto-dir>/stand-up.sh`: `docker compose up -d` with `COMPOSE_PROJECT_NAME=<sandbox-name>`, discovers the assigned host ports via `docker compose port`, writes a port table to `<auto-dir>/stand-ports.txt`, and waits up to 60s for each port to open (bash `/dev/tcp/`). If a port doesn't open in time, the run aborts.
+3. **Per-project post-up hook (optional)**: if `~/<project>/.container/claude-auto-post-up.sh` exists and is executable, it runs after the stack is healthy and before the reviewer starts. Use it for migrations, fixtures, sanitized snapshot restore — anything the project needs to be testable.
+4. **Reviewer prompt** gets a `== Стенд ==` block with the port table and a hint about `docker compose -p <sandbox-name> exec <svc>`. Dev's round 2+ prompt gets the same block (so dev can verify fixes against running services).
+5. **Tear-down via `trap EXIT`** — the stack is always brought down (`docker compose down -v`) on PASS, FAIL, error, or Ctrl-C.
+
+Database notes — claude-auto **does not** add a DB-specific abstraction in v1. The project's `docker-compose.yml` decides:
+
+- **Self-contained compose** (DB service in compose) → sandbox spins up its own DB container with an isolated volume (thanks to `COMPOSE_PROJECT_NAME`). Empty by default; load fixtures via the post-up hook if behavioral testing needs them.
+- **External DB** (project compose connects to `host.docker.internal:5432` or similar) → sandbox shares the same external DB with production. **Write tasks may corrupt production data** — be mindful.
+
+Caveats specific to `--stand`:
+
+- Requires git project (worktree mode). Copy-mode sandboxes (non-git projects) are rejected.
+- v1 looks for `./docker-compose.yml` (or `compose.yaml` / `compose.yml`) in the sandbox root only. Multi-file / monorepo projects need `--stand-compose-file PATH` (planned, not in v1).
+- Port collisions: if the project's compose hardcodes ports the override successfully randomizes them, but **named volumes** are isolated by `COMPOSE_PROJECT_NAME` automatically — no per-sandbox volume conflict.
+- Resource cost: a self-contained stack with mariadb + opensearch + redis adds ~30–60s of stand-up time and several GB of RAM. Skip `--stand` for refactors or tasks that don't need behavioral validation.
+- **No DB profiles yet.** When the QA agent comes (separate role, separate prompt), expect a `--stand-profile <name>` abstraction with predefined dev/qa/snapshot lifecycle steps. v1's `--stand` is the implicit "dev" profile.
+
 ### Caveats
 
-- **Cost.** Each round runs two long headless sessions. Real tasks observed at ~$5–10 per dev pass and ~$1–3 per reviewer pass on Opus. Watch the `[done: cost=...]` markers; cap with `--rounds 1` for cheap dry runs.
+- **Cost.** Each round runs two long headless sessions. Real tasks observed at ~$5–10 per dev pass and ~$1–3 per reviewer pass on Opus. Watch the `[done: cost=...]` markers; cap with `--rounds 1` for cheap dry runs. `--stand` adds the cost of the running stack (host resources, not LLM tokens).
 - **`bypassPermissions` for both agents.** Headless mode can't ask for per-tool permission interactively, so the default mode would block any MCP call (and a lot of useful Bash). Reviewer doesn't write much in practice, but it can — review the diff before merging. Tighter allowlists via `--allowedTools` are tracked as a follow-up.
 - **Verdict discipline.** The reviewer is instructed to end with a strict trailer. If it forgets, `claude-auto` retries the review pass once with a stricter reminder, same session. If the trailer is still missing, the run aborts with a clear error rather than guessing.
 - **Non-git projects.** Only git projects work — review needs `git diff <base>..<branch>`. For copy-mode projects, use the manual sandbox flow.

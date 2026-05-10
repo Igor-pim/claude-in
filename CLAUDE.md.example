@@ -59,6 +59,7 @@ Parentheses so Claude's cwd doesn't get stuck in the host mirror.
 
 ## Autonomous mode
 
-- `claude-auto <project> <task-source ...> [--rounds N]` runs an unattended dev → review loop on top of a sandbox. The task is composed from one or more sources: `--jira KEY` (repeatable), `--confluence PAGE_ID` (repeatable), `--prompt "TEXT"`, or `--prompt-file PATH` (`-` = stdin); the 2nd positional is a back-compat shorthand for `--jira`. Both agents are headless `claude -p` sessions inside `claude-box`; reviewer emits `VERDICT: PASS|FAIL` and the loop iterates up to `--rounds` (default 3, max 4). Beta — review the diff before merging.
+- `claude-auto <project> <task-source ...> [--rounds N] [--stand]` runs an unattended dev → review loop on top of a sandbox. The task is composed from one or more sources: `--jira KEY` (repeatable), `--confluence PAGE_ID` (repeatable), `--prompt "TEXT"`, or `--prompt-file PATH` (`-` = stdin); the 2nd positional is a back-compat shorthand for `--jira`. Both agents are headless `claude -p` sessions inside `claude-box`; reviewer emits `VERDICT: PASS|FAIL` and the loop iterates up to `--rounds` (default 3, max 4). Beta — review the diff before merging.
+- Add `--stand` to bring up the project's `docker-compose.yml` in the sandbox (isolated via `COMPOSE_PROJECT_NAME`, host ports randomized, torn down on exit) so the reviewer can curl endpoints / `docker exec` into services. Optional per-project hook for migrations/fixtures: `~/<project>/.container/claude-auto-post-up.sh` (executable).
 - Logs and prompts land under `~/workspace/sandbox/.meta/<sandbox-name>-auto/`; the sandbox itself behaves like any other (cleanup via `claude-in --sandbox-remove`).
 - Full details — see `README.md`.

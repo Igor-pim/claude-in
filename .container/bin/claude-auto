@@ -46,6 +46,11 @@ Options:
   --rounds N          Max review rounds (1..4, default 3). On VERDICT: PASS the
                       loop exits early.
   --name NAME         Custom sandbox name (default <project>-<YYMMDD-HHMM>-auto).
+  --stand             Bring up the project's docker compose stack inside the
+                      sandbox after dev round 1. Reviewer (and dev rounds 2+)
+                      get a port table in their prompt and can curl/docker exec
+                      into running services. Stack is torn down on exit.
+                      Requires git project (worktree mode).
   -h, --help          Show this help.
 
 Examples:
@@ -55,15 +60,25 @@ Examples:
   claude-auto my-api --prompt "Add /healthz endpoint returning {status:ok}"
   claude-auto my-api --jira PROJ-1234 --prompt "Reuse the existing helper instead of writing a new one."
   echo "Refactor X..." | claude-auto my-api --prompt-file -
+  claude-auto my-api --jira PROJ-1234 --stand           # with live review stand
 
 Layout:
   ~/workspace/sandbox/<name>/                  fresh git worktree (or copy)
   ~/workspace/sandbox/.meta/<name>.env         sandbox metadata (claude-in compatible)
   ~/workspace/sandbox/.meta/<name>-auto/       per-round prompts, logs, session ids
-    session-ids.env                            sources + UUIDs
+    session-ids.env                            sources + UUIDs + stand flag
     inline-prompt.txt                          resolved --prompt / --prompt-file content (if any)
     round-<N>-dev.{prompt.txt,log,jsonl}
     round-<N>-review.{prompt.txt,log,jsonl}
+    docker-compose.review-stand.yml            (--stand) port-randomization override
+    stand-up.sh / stand-down.sh                (--stand) lifecycle helpers
+    stand-ports.txt                            (--stand) host:container port table
+
+Optional per-project hook (--stand only):
+  ~/<project>/.container/claude-auto-post-up.sh
+  Executable script run inside claude-box after stand-up succeeds and
+  before reviewer starts. Use it for migrations, fixtures, sanitized
+  snapshots — whatever the project needs to be testable.
 
 After the run:
   PASS — sandbox is left in place; review the diff and `git merge claude/<name>`
@@ -164,6 +179,8 @@ EOF
 TASK_JIRA_KEYS=()
 TASK_CONFLUENCE_PAGES=()
 TASK_PROMPT_BLOCK=""
+STAND=0
+project=""    # filled in main(); used by emit_stand_block for post-up hook hint
 
 # Render task sources as labeled blocks. Output goes to stdout (from a heredoc
 # substitution). Empty sources are skipped, so the resulting prompt contains
@@ -205,7 +222,7 @@ EOF
 }
 
 dev_prompt_round() {
-  local feedback="$1"
+  local feedback="$1" sandbox_name="$2"
   cat <<EOF
 Ревьюер вернул замечания после предыдущего раунда:
 
@@ -214,16 +231,18 @@ $feedback
 ---
 
 Учти их, исправь код в этом же worktree, закоммить новый коммит. В конце вывода кратко перечисли, что изменил.
+$(emit_stand_block "$sandbox_name")
 EOF
 }
 
 review_prompt_initial() {
-  local branch="$1" base="$2"
+  local branch="$1" base="$2" sandbox_name="$3"
   cat <<EOF
 Ты — независимый ревьюер. Источники постановки задачи:
 $(emit_source_blocks)
 
 Реализация лежит в ветке \`$branch\` (sandbox worktree). База — \`$base\`. Текущий рабочий каталог — основной checkout проекта; ветка \`$branch\` видна в git как обычная локальная ветка.
+$(emit_stand_block "$sandbox_name")
 
 Шаги:
 1. Прочти все источники постановки выше (Jira/Confluence — через MCP, Дополнительные инструкции — как текст).
@@ -242,11 +261,12 @@ EOF
 }
 
 review_prompt_round() {
-  local branch="$1"
+  local branch="$1" sandbox_name="$2"
   cat <<EOF
 Разработчик добавил коммиты к ветке \`$branch\` после твоих замечаний. Проверь свежие изменения:
 1. Посмотри новые коммиты через Bash: \`git log --oneline $branch\` и diff последних коммитов.
 2. По каждому пункту своих предыдущих замечаний — учтено или нет.
+$(emit_stand_block "$sandbox_name")
 
 Тот же формат: на отдельной последней строке \`VERDICT: PASS\` или \`VERDICT: FAIL\`, плюс новый нумерованный список замечаний для FAIL.
 EOF
@@ -262,6 +282,203 @@ review_prompt_strict_retry() {
 
 Ничего после verdict-строки и списка не пиши.
 EOF
+}
+
+# Returns the formatted == Стенд == block ready to embed in dev/review prompts.
+# Empty output if STAND is off or stand-ports.txt doesn't exist yet.
+emit_stand_block() {
+  local sandbox_name="$1"
+  [[ "$STAND" == "1" ]] || return 0
+  local ports_file="$META_DIR/${sandbox_name}-auto/stand-ports.txt"
+  [[ -s "$ports_file" ]] || return 0
+
+  printf '\n== Стенд ==\n'
+  printf 'Запущен docker compose стек проекта (свежие контейнеры, host-порты рандомизированы):\n'
+  printf '```\n'
+  cat "$ports_file"
+  printf '```\n\n'
+  cat <<EOF
+Можешь:
+- Хитнуть эндпоинты curl-ом по адресам выше.
+- Зайти в сервис: \`docker exec -it \$(docker ps -q -f name=${sandbox_name}-<service>) bash\` (или \`docker compose -p ${sandbox_name} exec <service> bash\` из cwd проекта/sandbox).
+- Глянуть логи: \`docker compose -p ${sandbox_name} logs <service>\`.
+
+БД — свежие контейнеры (если compose проекта поднимает свои); фикстуры зависят от проекта (см. \`~/${project}/.container/claude-auto-post-up.sh\` если есть).
+EOF
+}
+
+# ----- stand lifecycle -----
+
+# Generate the port-override compose file + stand-up.sh + stand-down.sh.
+# Does NOT touch docker; just emits files. Safe to call before sandbox is in
+# any particular state. Returns non-zero if no ports were found in the
+# project's compose (nothing to expose → stand makes no sense).
+prepare_stand() {
+  local sandbox_name="$1" project="$2" auto_dir="$3"
+  local sandbox_host="$SANDBOX_DIR/$sandbox_name"
+  local sandbox_cont="/workspace/sandbox/$sandbox_name"
+  local auto_dir_cont="/workspace/sandbox/.meta/${sandbox_name}-auto"
+  local override_host="$auto_dir/docker-compose.review-stand.yml"
+
+  if [[ ! -f "$sandbox_host/docker-compose.yml" && ! -f "$sandbox_host/compose.yaml" && ! -f "$sandbox_host/compose.yml" ]]; then
+    echo "claude-auto: --stand: no docker-compose.yml in $sandbox_host" >&2
+    return 1
+  fi
+
+  # Extract (service, container_port) pairs from the resolved compose config.
+  local mappings
+  if ! mappings=$(docker exec -i \
+      -w "$sandbox_cont" \
+      "$CONTAINER" \
+      bash -c '
+        docker compose config --format json 2>/dev/null \
+          | jq -r ".services | to_entries[] |
+                   select(.value.ports != null and (.value.ports | length) > 0) |
+                   .key as \$svc | .value.ports[] |
+                   \"\(\$svc) \(.target // .container_port // 0)\""
+      '); then
+    echo "claude-auto: --stand: \`docker compose config\` failed in $sandbox_cont" >&2
+    echo "  fix the compose syntax or env vars first; then re-run." >&2
+    return 1
+  fi
+
+  if [[ -z "$mappings" ]]; then
+    echo "claude-auto: --stand: project compose has no \`ports:\` declarations — nothing to expose" >&2
+    return 1
+  fi
+
+  # Group mappings by service and emit override yaml.
+  declare -A svc_targets
+  while read -r svc target; do
+    [[ -z "$svc" ]] && continue
+    svc_targets[$svc]+="$target "
+  done <<< "$mappings"
+
+  {
+    echo "# Auto-generated by claude-auto --stand. Do not edit."
+    echo "# Each project port is remapped to a random free host port (Docker picks via 0)."
+    echo "services:"
+    local svc target
+    for svc in "${!svc_targets[@]}"; do
+      echo "  $svc:"
+      echo "    ports:"
+      for target in ${svc_targets[$svc]}; do
+        echo "      - \"0:$target\""
+      done
+    done
+  } > "$override_host"
+
+  # stand-up.sh: bring up + discover ports + health-wait + post-up hook.
+  # Runs inside claude-box; HOST_HOME and bind-mount layout assumed.
+  cat > "$auto_dir/stand-up.sh" <<EOF
+#!/usr/bin/env bash
+# Auto-generated by claude-auto --stand. Brings up the sandbox stack with
+# random host ports, waits for them to open, and writes the port table to
+# stand-ports.txt for prompt injection.
+set -euo pipefail
+
+SANDBOX_DIR="\${HOST_HOME:-\$HOME}/workspace/sandbox/$sandbox_name"
+AUTO_DIR="$auto_dir_cont"
+OVERRIDE="\$AUTO_DIR/docker-compose.review-stand.yml"
+PORTS_FILE="\$AUTO_DIR/stand-ports.txt"
+PROJECT="$project"
+PROJ_POSTUP="\${HOST_HOME:-\$HOME}/\$PROJECT/.container/claude-auto-post-up.sh"
+TIMEOUT_SEC=60
+
+cd "\$SANDBOX_DIR"
+
+echo "stand-up: docker compose up -d (project=$sandbox_name)..."
+COMPOSE_PROJECT_NAME="$sandbox_name" docker compose -f docker-compose.yml -f "\$OVERRIDE" up -d
+
+# Discover assigned host ports per service:port.
+: > "\$PORTS_FILE"
+while read -r svc target; do
+  [[ -z "\$svc" ]] && continue
+  hostport=\$(COMPOSE_PROJECT_NAME="$sandbox_name" docker compose -f docker-compose.yml -f "\$OVERRIDE" port "\$svc" "\$target" 2>/dev/null | awk -F: '{print \$NF}' | tr -d '[:space:]')
+  if [[ -n "\$hostport" && "\$hostport" != "0" ]]; then
+    printf '%-20s localhost:%-6s -> :%s\n' "\$svc" "\$hostport" "\$target" >> "\$PORTS_FILE"
+  fi
+done <<MAPPINGS
+$(while read -r svc target; do echo "$svc $target"; done <<< "$mappings")
+MAPPINGS
+
+if [[ ! -s "\$PORTS_FILE" ]]; then
+  echo "stand-up: no host ports could be discovered after up — check 'docker compose ps'" >&2
+  exit 1
+fi
+
+cat "\$PORTS_FILE"
+
+# Health-wait via bash /dev/tcp (no nc dependency).
+echo "stand-up: waiting up to \${TIMEOUT_SEC}s for ports to open..."
+while IFS= read -r line; do
+  hp=\$(echo "\$line" | awk '{print \$2}' | sed 's|^localhost:||')
+  svc=\$(echo "\$line" | awk '{print \$1}')
+  elapsed=0
+  until (echo > /dev/tcp/localhost/\$hp) 2>/dev/null; do
+    sleep 2
+    elapsed=\$((elapsed + 2))
+    if [[ \$elapsed -ge \$TIMEOUT_SEC ]]; then
+      echo "stand-up: \$svc localhost:\$hp didn't open in \${TIMEOUT_SEC}s" >&2
+      exit 1
+    fi
+  done
+  echo "stand-up:   \$svc localhost:\$hp [ready]"
+done < "\$PORTS_FILE"
+
+# Project-level post-up hook (optional).
+if [[ -x "\$PROJ_POSTUP" ]]; then
+  echo "stand-up: running project post-up hook: \$PROJ_POSTUP"
+  cd "\$SANDBOX_DIR" && "\$PROJ_POSTUP"
+fi
+
+echo "stand-up: ready"
+EOF
+  chmod +x "$auto_dir/stand-up.sh"
+
+  cat > "$auto_dir/stand-down.sh" <<EOF
+#!/usr/bin/env bash
+# Auto-generated by claude-auto --stand. Tears down the sandbox stack.
+# Best-effort: never blocks the orchestrator's exit.
+SANDBOX_DIR="\${HOST_HOME:-\$HOME}/workspace/sandbox/$sandbox_name"
+OVERRIDE="$auto_dir_cont/docker-compose.review-stand.yml"
+[[ -d "\$SANDBOX_DIR" ]] || exit 0
+cd "\$SANDBOX_DIR" || exit 0
+COMPOSE_PROJECT_NAME="$sandbox_name" docker compose -f docker-compose.yml -f "\$OVERRIDE" down -v 2>/dev/null || true
+EOF
+  chmod +x "$auto_dir/stand-down.sh"
+
+  echo "claude-auto: --stand: prepared override + helpers in $auto_dir/" >&2
+  return 0
+}
+
+# Run stand-up.sh inside claude-box, with HOST_HOME passed through.
+bring_stand_up() {
+  local sandbox_name="$1"
+  local auto_dir_cont="/workspace/sandbox/.meta/${sandbox_name}-auto"
+  echo "" >&2
+  echo "claude-auto: ----- bringing stand up -----" >&2
+  if ! docker exec -i \
+       -e "HOST_HOME=$HOME" \
+       "$CONTAINER" \
+       bash "$auto_dir_cont/stand-up.sh"; then
+    echo "claude-auto: stand-up failed" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Trap-friendly tear-down. Never returns non-zero (exit traps must not fail).
+bring_stand_down() {
+  local sandbox_name="$1"
+  local auto_dir_cont="/workspace/sandbox/.meta/${sandbox_name}-auto"
+  echo "" >&2
+  echo "claude-auto: ----- tearing stand down -----" >&2
+  docker exec -i \
+    -e "HOST_HOME=$HOME" \
+    "$CONTAINER" \
+    bash "$auto_dir_cont/stand-down.sh" 2>&1 | tail -5 >&2 || true
+  return 0
 }
 
 # ----- runners -----
@@ -300,14 +517,14 @@ STREAM_JQ_FILTER='
   else empty end
 '
 
-# Args: cwd_in_container, session_id, is_first_round, prompt_path_in_container, log_path_on_host, [bypass_perms]
+# Args: cwd_in_container, session_id, is_first_round, prompt_path_in_container, log_path_on_host, [bypass_perms], [compose_project_name]
 # Streams claude in real time:
 #   stdout = jq-formatted human lines (also tee'd to <log_path>).
 #   <log_path>.jsonl = raw stream-json events (for debugging or post-hoc analysis).
 # Pipeline runs entirely inside claude-box (jq lives there, not on host).
 # Host-side `tee` captures the formatted stream as the user sees it.
 run_claude() {
-  local cwd="$1" sid="$2" first="$3" prompt_path="$4" log_path="$5" bypass="${6:-0}"
+  local cwd="$1" sid="$2" first="$3" prompt_path="$4" log_path="$5" bypass="${6:-0}" cpn="${7:-}"
 
   local sess_arg
   if [[ "$first" -eq 1 ]]; then
@@ -322,11 +539,17 @@ run_claude() {
   local raw_log_host="${log_path%.log}.jsonl"
   local raw_log_cont="/workspace${raw_log_host#$WORKSPACE}"
 
+  # Optional COMPOSE_PROJECT_NAME passes through so docker-compose commands
+  # the agent runs target the sandbox stack (not whatever the cwd implies).
+  local -a extra_env=()
+  [[ -n "$cpn" ]] && extra_env=(-e "COMPOSE_PROJECT_NAME=$cpn")
+
   # Pipeline inside container: claude → tee raw → jq formatter.
   # PIPESTATUS lets us return claude's exit code, ignoring tee/jq fluctuations.
   set +e
   docker exec -i \
     -w "$cwd" \
+    "${extra_env[@]}" \
     -e "STREAM_JQ_FILTER=$STREAM_JQ_FILTER" \
     -e "AUTO_PROMPT=$prompt_path" \
     -e "AUTO_RAW=$raw_log_cont" \
@@ -370,7 +593,10 @@ extract_feedback() {
 # ----- main -----
 
 main() {
-  local project="" rounds="$DEFAULT_ROUNDS" custom_name=""
+  # `project` and `STAND` are intentionally globals (declared at module scope
+  # near the prompt builders) so emit_stand_block / emit_source_blocks can
+  # read them without explicit threading.
+  local rounds="$DEFAULT_ROUNDS" custom_name=""
   local prompt_inline="" prompt_file=""
   local positional_count=0
 
@@ -388,6 +614,7 @@ main() {
                        prompt_inline="$1"; shift ;;
       --prompt-file)   shift; [[ $# -gt 0 ]] || { echo "claude-auto: --prompt-file needs a value" >&2; exit 2; }
                        prompt_file="$1"; shift ;;
+      --stand)         STAND=1; shift ;;
       -h|--help)       usage; exit 0 ;;
       -*)              echo "claude-auto: unknown flag: $1" >&2; usage >&2; exit 2 ;;
       *)
@@ -478,6 +705,7 @@ project=$project
 jira_keys=$jira_csv
 confluence_pages=$conf_csv
 has_prompt=$([[ -n "$TASK_PROMPT_BLOCK" ]] && echo 1 || echo 0)
+stand=$STAND
 dev_session_id=$dev_sid
 review_session_id=$review_sid
 created=$(_iso_now)
@@ -487,15 +715,34 @@ EOF
     printf '%s\n' "$TASK_PROMPT_BLOCK" > "$auto_dir/inline-prompt.txt"
   fi
 
+  # Stand setup: generate override + helper scripts. Trap ensures tear-down
+  # on any exit (PASS, FAIL, error, Ctrl-C). The stand is brought up *after*
+  # dev round 1 so dev round 1 doesn't pay the cost when reviewer might
+  # PASS-trivially anyway.
+  if [[ "$STAND" == "1" ]]; then
+    if ! prepare_stand "$name" "$project" "$auto_dir"; then
+      echo "claude-auto: --stand: prepare failed; aborting" >&2
+      exit 1
+    fi
+    # shellcheck disable=SC2064
+    trap "bring_stand_down '$name'" EXIT
+  fi
+
   local sandbox_cwd="/workspace/sandbox/$name"
   local project_cwd="/workspace/projects/$project"
   local prompt_dir_in_container="/workspace/sandbox/.meta/${name}-auto"
+
+  # COMPOSE_PROJECT_NAME used to target the sandbox stack from any cwd.
+  # Empty when --stand is off (run_claude treats empty as "don't set").
+  local cpn=""
+  [[ "$STAND" == "1" ]] && cpn="$name"
 
   # Build a short summary of the task sources for the run-start banner.
   local source_summary_parts=()
   (( ${#TASK_JIRA_KEYS[@]} > 0 ))        && source_summary_parts+=("jira:$jira_csv")
   (( ${#TASK_CONFLUENCE_PAGES[@]} > 0 )) && source_summary_parts+=("confluence:$conf_csv")
   [[ -n "$TASK_PROMPT_BLOCK" ]]          && source_summary_parts+=("prompt:${#TASK_PROMPT_BLOCK}ch")
+  [[ "$STAND" == "1" ]]                  && source_summary_parts+=("stand:on")
   local source_summary=$(IFS=' '; printf '%s' "${source_summary_parts[*]}")
 
   echo "claude-auto: ===== run start: $project / $source_summary — up to $rounds round(s) =====" >&2
@@ -513,12 +760,12 @@ EOF
     if [[ "$r" -eq 1 ]]; then
       dev_prompt_initial "$branch" "$base_branch" > "$dev_prompt_host"
     else
-      dev_prompt_round "$feedback" > "$dev_prompt_host"
+      dev_prompt_round "$feedback" "$name" > "$dev_prompt_host"
     fi
 
     echo "claude-auto: dev round $r — start $(_iso_now)" >&2
     if ! run_claude "$sandbox_cwd" "$dev_sid" "$([[ $r -eq 1 ]] && echo 1 || echo 0)" \
-                    "$dev_prompt_cont" "$dev_log" 1; then
+                    "$dev_prompt_cont" "$dev_log" 1 "$cpn"; then
       echo "claude-auto: dev round $r — non-zero exit. Sandbox: $SANDBOX_DIR/$name" >&2
       exit 1
     fi
@@ -528,20 +775,28 @@ EOF
     dev_commits=$(git -C "$SANDBOX_DIR/$name" rev-list --count "$base_branch..HEAD" 2>/dev/null || echo "?")
     echo "claude-auto: dev round $r — $dev_commits commit(s) on $branch" >&2
 
+    # ---------- STAND (after dev round 1, persists across rounds) ----------
+    if [[ "$STAND" == "1" && "$r" -eq 1 ]]; then
+      if ! bring_stand_up "$name"; then
+        echo "claude-auto: --stand: stand-up failed. Sandbox: $SANDBOX_DIR/$name" >&2
+        exit 1
+      fi
+    fi
+
     # ---------- REVIEW ----------
     local rev_prompt_host="$auto_dir/round-${r}-review.prompt.txt"
     local rev_prompt_cont="$prompt_dir_in_container/round-${r}-review.prompt.txt"
     local rev_log="$auto_dir/round-${r}-review.log"
 
     if [[ "$r" -eq 1 ]]; then
-      review_prompt_initial "$branch" "$base_branch" > "$rev_prompt_host"
+      review_prompt_initial "$branch" "$base_branch" "$name" > "$rev_prompt_host"
     else
-      review_prompt_round "$branch" > "$rev_prompt_host"
+      review_prompt_round "$branch" "$name" > "$rev_prompt_host"
     fi
 
     echo "claude-auto: review round $r — start $(_iso_now)" >&2
     if ! run_claude "$project_cwd" "$review_sid" "$([[ $r -eq 1 ]] && echo 1 || echo 0)" \
-                    "$rev_prompt_cont" "$rev_log" 1; then
+                    "$rev_prompt_cont" "$rev_log" 1 "$cpn"; then
       echo "claude-auto: review round $r — non-zero exit. Sandbox: $SANDBOX_DIR/$name" >&2
       exit 1
     fi
@@ -556,7 +811,7 @@ EOF
       local retry_prompt_cont="$prompt_dir_in_container/round-${r}-review-retry.prompt.txt"
       local retry_log="$auto_dir/round-${r}-review-retry.log"
       review_prompt_strict_retry > "$retry_prompt_host"
-      run_claude "$project_cwd" "$review_sid" 0 "$retry_prompt_cont" "$retry_log" 1 || true
+      run_claude "$project_cwd" "$review_sid" 0 "$retry_prompt_cont" "$retry_log" 1 "$cpn" || true
       verdict=$(parse_verdict "$retry_log")
       [[ "$verdict" == "FAIL" ]] && rev_log="$retry_log"
     fi
