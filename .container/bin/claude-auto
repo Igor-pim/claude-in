@@ -46,11 +46,26 @@ Options:
   --rounds N          Max review rounds (1..4, default 3). On VERDICT: PASS the
                       loop exits early.
   --name NAME         Custom sandbox name (default <project>-<YYMMDD-HHMM>-auto).
-  --stand             Bring up the project's docker compose stack inside the
-                      sandbox after dev round 1. Reviewer (and dev rounds 2+)
-                      get a port table in their prompt and can curl/docker exec
-                      into running services. Stack is torn down on exit.
+  --stand             Bring up the project's app service(s) in the sandbox
+                      after dev round 1 (default = `app` mode: only services
+                      with `build:`). Reviewer / dev rounds 2+ get a port
+                      table and can curl/docker exec into them. App mode
+                      auto-attaches to the prod stack's docker network so
+                      DB/Redis/... are reused from the running prod stack —
+                      reads ~/<project>/.env for PROJECT_NAME and looks up
+                      a network labeled with it. Stack is torn down on exit.
                       Requires git project (worktree mode).
+  --stand=full        Bring up the WHOLE stack in isolation (own fresh
+                      DB/Redis containers, no prod-network attachment).
+                      Use when there's no running prod stack, or for tasks
+                      that must not touch prod data.
+  --stand-services s1,s2,...
+                      Explicit list of compose services to bring up (overrides
+                      app/full auto-detection). Comma-separated. Implies app
+                      mode for network attachment.
+  --stand-network NAME
+                      Override the prod network to attach to (skips auto-detect
+                      from ~/<project>/.env). Has no effect with --stand=full.
   -h, --help          Show this help.
 
 Examples:
@@ -60,7 +75,9 @@ Examples:
   claude-auto my-api --prompt "Add /healthz endpoint returning {status:ok}"
   claude-auto my-api --jira PROJ-1234 --prompt "Reuse the existing helper instead of writing a new one."
   echo "Refactor X..." | claude-auto my-api --prompt-file -
-  claude-auto my-api --jira PROJ-1234 --stand           # with live review stand
+  claude-auto my-api --jira PROJ-1234 --stand                 # app-only + prod DB
+  claude-auto my-api --jira PROJ-1234 --stand=full            # full isolated stack
+  claude-auto my-api --jira PROJ-1234 --stand-services php,worker
 
 Layout:
   ~/workspace/sandbox/<name>/                  fresh git worktree (or copy)
@@ -74,11 +91,16 @@ Layout:
     stand-up.sh / stand-down.sh                (--stand) lifecycle helpers
     stand-ports.txt                            (--stand) host:container port table
 
-Optional per-project hook (--stand only):
+Optional per-project hooks:
+  ~/<project>/.container/sandbox-init.sh
+  Executable. Runs ON HOST right after `git worktree add` (any sandbox,
+  not just --stand). Gets sandbox path as $1. Use it to chmod +x scripts
+  that git tracks as 100644, copy local secrets, create symlinks, etc.
+
   ~/<project>/.container/claude-auto-post-up.sh
-  Executable script run inside claude-box after stand-up succeeds and
-  before reviewer starts. Use it for migrations, fixtures, sanitized
-  snapshots — whatever the project needs to be testable.
+  Executable. Runs INSIDE claude-box after --stand brings the stack up
+  and before reviewer starts. For migrations, fixtures, sanitized
+  snapshot restore.
 
 After the run:
   PASS — sandbox is left in place; review the diff and `git merge claude/<name>`
@@ -93,6 +115,19 @@ EOF
 # ----- helpers -----
 
 _iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# Run the project's per-sandbox init hook if present. Convention:
+# ~/<project>/.container/sandbox-init.sh, executable, takes sandbox path as $1.
+# Use it for project-specific fix-ups (chmod +x on scripts that git tracks as
+# 100644 but the project needs executable, copying secrets, symlinks, etc).
+run_sandbox_init_hook() {
+  local src="$1" dest="$2"
+  local hook="$src/.container/sandbox-init.sh"
+  [[ -x "$hook" ]] || return 0
+  echo "claude-auto: running sandbox init hook: $hook" >&2
+  # Hook stdout → stderr so it doesn't contaminate $(create_sandbox) capture.
+  "$hook" "$dest" >&2
+}
 
 gen_uuid() {
   if [[ -r /proc/sys/kernel/random/uuid ]]; then
@@ -150,6 +185,7 @@ EOF
     branch="claude/$name"
     base=$(git -C "$src" rev-parse --abbrev-ref HEAD)
     git -C "$src" worktree add "$dest" -b "$branch" >&2
+    run_sandbox_init_hook "$src" "$dest"
     cat > "$META_DIR/$name.env" <<EOF
 source_repo=$src
 mode=worktree
@@ -180,7 +216,10 @@ TASK_JIRA_KEYS=()
 TASK_CONFLUENCE_PAGES=()
 TASK_PROMPT_BLOCK=""
 STAND=0
-project=""    # filled in main(); used by emit_stand_block for post-up hook hint
+STAND_MODE="app"        # app | full | explicit. Set by --stand[=mode] / --stand-services.
+STAND_SERVICES=()       # explicit service list from --stand-services
+STAND_NETWORK=""        # explicit boevoy network from --stand-network; auto-detected when empty
+project=""              # filled in main(); used by emit_stand_block + boevoy detection
 
 # Render task sources as labeled blocks. Output goes to stdout (from a heredoc
 # substitution). Empty sources are skipped, so the resulting prompt contains
@@ -286,33 +325,92 @@ EOF
 
 # Returns the formatted == Стенд == block ready to embed in dev/review prompts.
 # Empty output if STAND is off or stand-ports.txt doesn't exist yet.
+# Reads stand mode/network from <auto-dir>/stand-meta.env so the warning text
+# matches whatever prepare_stand actually configured.
 emit_stand_block() {
   local sandbox_name="$1"
   [[ "$STAND" == "1" ]] || return 0
   local ports_file="$META_DIR/${sandbox_name}-auto/stand-ports.txt"
   [[ -s "$ports_file" ]] || return 0
 
+  local meta_file="$META_DIR/${sandbox_name}-auto/stand-meta.env"
+  local mode="" network=""
+  if [[ -f "$meta_file" ]]; then
+    # shellcheck disable=SC1090
+    . "$meta_file"
+  fi
+
   printf '\n== Стенд ==\n'
-  printf 'Запущен docker compose стек проекта (свежие контейнеры, host-порты рандомизированы):\n'
-  printf '```\n'
+  case "$mode" in
+    app)
+      if [[ -n "$network" ]]; then
+        printf 'Поднят app-стенд: только проектные сервисы; инфра (БД/Redis/...) — из боевой сети `%s`.\n' "$network"
+      else
+        printf 'Поднят app-стенд: только проектные сервисы; инфра не подключена.\n'
+      fi
+      ;;
+    full)
+      printf 'Поднят полный стек проекта в изоляции — свежие контейнеры, ничего не шарится с боевой средой.\n'
+      ;;
+    *)
+      printf 'Запущен docker compose стек проекта.\n'
+      ;;
+  esac
+  printf 'Host-порты рандомизированы:\n```\n'
   cat "$ports_file"
   printf '```\n\n'
+
   cat <<EOF
 Можешь:
 - Хитнуть эндпоинты curl-ом по адресам выше.
-- Зайти в сервис: \`docker exec -it \$(docker ps -q -f name=${sandbox_name}-<service>) bash\` (или \`docker compose -p ${sandbox_name} exec <service> bash\` из cwd проекта/sandbox).
+- Зайти в сервис: \`docker exec -it ${sandbox_name}_<service> bash\` (или \`docker compose -p ${sandbox_name} exec <service> bash\`).
 - Глянуть логи: \`docker compose -p ${sandbox_name} logs <service>\`.
+EOF
+
+  if [[ "$mode" == "app" && -n "$network" ]]; then
+    cat <<EOF
+
+**ВАЖНО:** app-контейнер подключён к боевой сети \`${network}\`. БД, Redis и прочая инфра — **БОЕВЫЕ**. Чтения безопасны, **write-операции оставят следы**. Если задача что-то пишет в БД — ограничься dry-run / read-only проверкой; если нужна реальная запись, явно подтверди план в выводе перед запуском.
+EOF
+  elif [[ "$mode" == "full" ]]; then
+    cat <<EOF
 
 БД — свежие контейнеры (если compose проекта поднимает свои); фикстуры зависят от проекта (см. \`~/${project}/.container/claude-auto-post-up.sh\` если есть).
 EOF
+  fi
 }
 
 # ----- stand lifecycle -----
 
+# Auto-detect the prod stack's docker network so the sandbox app can reach
+# DB/Redis/etc as if it were a member of the prod stack. Reads
+# ~/<project>/.env for PROJECT_NAME or COMPOSE_PROJECT_NAME, then asks Docker
+# for a network labeled `com.docker.compose.project=<that>`.
+# Returns network name on stdout, empty on inconclusive result.
+detect_prod_network() {
+  local project="$1"
+  local env_file="${HOME}/${project}/.env"
+  [[ -f "$env_file" ]] || return 0
+  local proj_name
+  proj_name=$(grep -E "^(COMPOSE_PROJECT_NAME|PROJECT_NAME)=" "$env_file" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | xargs)
+  [[ -z "$proj_name" ]] && return 0
+  local -a nets=()
+  mapfile -t nets < <(docker network ls --filter "label=com.docker.compose.project=$proj_name" --format '{{.Name}}' 2>/dev/null)
+  if [[ ${#nets[@]} -eq 1 ]]; then
+    printf '%s\n' "${nets[0]}"
+  elif [[ ${#nets[@]} -gt 1 ]]; then
+    printf '%s\n' "MULTIPLE:${nets[*]}" >&2
+    return 1
+  fi
+  return 0
+}
+
 # Generate the port-override compose file + stand-up.sh + stand-down.sh.
-# Does NOT touch docker; just emits files. Safe to call before sandbox is in
-# any particular state. Returns non-zero if no ports were found in the
-# project's compose (nothing to expose → stand makes no sense).
+# Selects services based on STAND_MODE (app | full | explicit). Resets each
+# service's container_name to <sandbox>_<svc> so explicit `container_name:`
+# directives in the project's compose don't collide with the prod stack.
+# For app/explicit modes, attaches to the auto-detected prod network so the
+# sandbox app can reach prod DB/Redis. Returns non-zero on hard failures.
 prepare_stand() {
   local sandbox_name="$1" project="$2" auto_dir="$3"
   local sandbox_host="$SANDBOX_DIR/$sandbox_name"
@@ -325,56 +423,159 @@ prepare_stand() {
     return 1
   fi
 
-  # Extract (service, container_port) pairs from the resolved compose config.
-  local mappings
-  if ! mappings=$(docker exec -i \
+  # Get full compose config as JSON for filtering services + ports.
+  local compose_json
+  if ! compose_json=$(docker exec -i \
       -w "$sandbox_cont" \
       "$CONTAINER" \
-      bash -c '
-        docker compose config --format json 2>/dev/null \
-          | jq -r ".services | to_entries[] |
-                   select(.value.ports != null and (.value.ports | length) > 0) |
-                   .key as \$svc | .value.ports[] |
-                   \"\(\$svc) \(.target // .container_port // 0)\""
-      '); then
+      bash -c "docker compose config --format json 2>/dev/null"); then
     echo "claude-auto: --stand: \`docker compose config\` failed in $sandbox_cont" >&2
     echo "  fix the compose syntax or env vars first; then re-run." >&2
     return 1
   fi
 
+  # Determine which services to include in the stand.
+  local -a selected_services=()
+  case "$STAND_MODE" in
+    full)
+      mapfile -t selected_services < <(printf '%s' "$compose_json" | docker exec -i "$CONTAINER" jq -r '
+        .services | to_entries[] |
+        select(.value.ports != null and (.value.ports | length) > 0) |
+        .key')
+      ;;
+    app)
+      mapfile -t selected_services < <(printf '%s' "$compose_json" | docker exec -i "$CONTAINER" jq -r '
+        .services | to_entries[] |
+        select(.value.build != null) |
+        .key')
+      if [[ ${#selected_services[@]} -eq 0 ]]; then
+        echo "claude-auto: --stand (app mode): no services with \`build:\` directive found." >&2
+        echo "  Either the compose has only image:-based infra, or you want a different mode." >&2
+        echo "  Try --stand=full for the whole stack, or --stand-services <s1,s2,...> explicitly." >&2
+        return 1
+      fi
+      ;;
+    explicit)
+      selected_services=("${STAND_SERVICES[@]}")
+      local s
+      for s in "${selected_services[@]}"; do
+        if ! printf '%s' "$compose_json" | docker exec -i "$CONTAINER" jq -e --arg svc "$s" '.services | has($svc)' >/dev/null; then
+          echo "claude-auto: --stand-services: service '$s' not found in compose" >&2
+          return 1
+        fi
+      done
+      ;;
+    *)
+      echo "claude-auto: --stand: invalid mode '$STAND_MODE' (expected app|full or use --stand-services)" >&2
+      return 1
+      ;;
+  esac
+
+  echo "claude-auto: --stand mode=$STAND_MODE, services=[${selected_services[*]}]" >&2
+
+  # Build (svc, container_port) pairs for selected services only.
+  local svcs_json
+  svcs_json=$(printf '%s\n' "${selected_services[@]}" | docker exec -i "$CONTAINER" jq -R . | docker exec -i "$CONTAINER" jq -s .)
+  local mappings
+  mappings=$(printf '%s' "$compose_json" | docker exec -i "$CONTAINER" jq -r --argjson svcs "$svcs_json" '
+    .services | to_entries[] |
+    select(.value.ports != null and (.value.ports | length) > 0) |
+    select(.key as $k | $svcs | index($k)) |
+    .key as $svc | .value.ports[] |
+    "\($svc) \(.target // .container_port // 0)"
+  ')
+
   if [[ -z "$mappings" ]]; then
-    echo "claude-auto: --stand: project compose has no \`ports:\` declarations — nothing to expose" >&2
+    echo "claude-auto: --stand: selected services have no \`ports:\` — nothing to expose" >&2
+    echo "  selected: ${selected_services[*]}" >&2
     return 1
   fi
 
-  # Group mappings by service and emit override yaml.
   declare -A svc_targets
   while read -r svc target; do
     [[ -z "$svc" ]] && continue
     svc_targets[$svc]+="$target "
   done <<< "$mappings"
 
+  # Prod-network attachment: skip for `full` mode (isolated by design).
+  # Use --stand-network if explicitly given, else try auto-detect.
+  local prod_net=""
+  if [[ "$STAND_MODE" != "full" ]]; then
+    if [[ -n "$STAND_NETWORK" ]]; then
+      prod_net="$STAND_NETWORK"
+      if ! docker network inspect "$prod_net" >/dev/null 2>&1; then
+        echo "claude-auto: --stand-network: network '$prod_net' not found" >&2
+        return 1
+      fi
+      echo "claude-auto: --stand: using prod network '$prod_net' (from --stand-network)" >&2
+    else
+      if ! prod_net=$(detect_prod_network "$project"); then
+        echo "claude-auto: --stand: multiple candidate prod networks — re-run with --stand-network NAME" >&2
+        return 1
+      fi
+      if [[ -n "$prod_net" ]]; then
+        echo "claude-auto: --stand: detected prod network '$prod_net'" >&2
+      else
+        echo "claude-auto: --stand: no prod network found (start your prod stack first, or pass --stand-network NAME, or use --stand=full)" >&2
+        echo "  Continuing without network attachment — app container may fail to reach DB/Redis." >&2
+      fi
+    fi
+  fi
+
+  # Emit override yaml. Critical details:
+  # - `ports: !override` REPLACES the inherited list (compose default would
+  #   merge, leading to "port already allocated" when project's compose has
+  #   a hardcoded host port like 8080:80 and we also try 0:80).
+  # - container_name is forced to <sandbox>_<svc> (scalar override is plain
+  #   replace — no special tag needed) to avoid collision with explicit
+  #   container_name: in project's compose that uses the prod project name.
   {
     echo "# Auto-generated by claude-auto --stand. Do not edit."
-    echo "# Each project port is remapped to a random free host port (Docker picks via 0)."
+    echo "# mode=$STAND_MODE, services=[${selected_services[*]}]"
+    [[ -n "$prod_net" ]] && echo "# attached to prod network: $prod_net"
     echo "services:"
     local svc target
     for svc in "${!svc_targets[@]}"; do
       echo "  $svc:"
-      echo "    ports:"
+      echo "    container_name: ${sandbox_name}_${svc}"
+      echo "    ports: !override"
       for target in ${svc_targets[$svc]}; do
         echo "      - \"0:$target\""
       done
+      if [[ -n "$prod_net" ]]; then
+        echo "    networks:"
+        echo "      - default"
+        echo "      - prod"
+      fi
     done
+    if [[ -n "$prod_net" ]]; then
+      echo "networks:"
+      echo "  prod:"
+      echo "    name: $prod_net"
+      echo "    external: true"
+    fi
   } > "$override_host"
+
+  # Stand metadata for emit_stand_block + later inspection.
+  cat > "$auto_dir/stand-meta.env" <<META
+mode=$STAND_MODE
+network=$prod_net
+services=${selected_services[*]}
+META
 
   # stand-up.sh: bring up + discover ports + health-wait + post-up hook.
   # Runs inside claude-box; HOST_HOME and bind-mount layout assumed.
+  # For non-full modes we pass explicit service names + --no-deps so compose
+  # doesn't try to also start the infra services we deliberately skipped.
+  local up_services="${selected_services[*]}"
+  local up_flags=""
+  [[ "$STAND_MODE" != "full" ]] && up_flags="--no-deps"
+
   cat > "$auto_dir/stand-up.sh" <<EOF
 #!/usr/bin/env bash
-# Auto-generated by claude-auto --stand. Brings up the sandbox stack with
-# random host ports, waits for them to open, and writes the port table to
-# stand-ports.txt for prompt injection.
+# Auto-generated by claude-auto --stand. mode=$STAND_MODE
+# Brings up the sandbox stack with random host ports, waits for them to open,
+# and writes the port table to stand-ports.txt for prompt injection.
 set -euo pipefail
 
 SANDBOX_DIR="\${HOST_HOME:-\$HOME}/workspace/sandbox/$sandbox_name"
@@ -383,12 +584,16 @@ OVERRIDE="\$AUTO_DIR/docker-compose.review-stand.yml"
 PORTS_FILE="\$AUTO_DIR/stand-ports.txt"
 PROJECT="$project"
 PROJ_POSTUP="\${HOST_HOME:-\$HOME}/\$PROJECT/.container/claude-auto-post-up.sh"
-TIMEOUT_SEC=60
+TIMEOUT_SEC=\${STAND_HEALTH_TIMEOUT_SEC:-180}
+# Host where published ports live: from inside claude-box, host's ports are at
+# host.docker.internal (set via extra_hosts in workspace compose). Outside of
+# claude-box this hostname won't resolve, but stand-up.sh always runs inside.
+HOST=host.docker.internal
 
 cd "\$SANDBOX_DIR"
 
-echo "stand-up: docker compose up -d (project=$sandbox_name)..."
-COMPOSE_PROJECT_NAME="$sandbox_name" docker compose -f docker-compose.yml -f "\$OVERRIDE" up -d
+echo "stand-up: mode=$STAND_MODE, services=[$up_services]..."
+COMPOSE_PROJECT_NAME="$sandbox_name" docker compose -f docker-compose.yml -f "\$OVERRIDE" up -d $up_flags $up_services
 
 # Discover assigned host ports per service:port.
 : > "\$PORTS_FILE"
@@ -396,7 +601,7 @@ while read -r svc target; do
   [[ -z "\$svc" ]] && continue
   hostport=\$(COMPOSE_PROJECT_NAME="$sandbox_name" docker compose -f docker-compose.yml -f "\$OVERRIDE" port "\$svc" "\$target" 2>/dev/null | awk -F: '{print \$NF}' | tr -d '[:space:]')
   if [[ -n "\$hostport" && "\$hostport" != "0" ]]; then
-    printf '%-20s localhost:%-6s -> :%s\n' "\$svc" "\$hostport" "\$target" >> "\$PORTS_FILE"
+    printf '%-20s \$HOST:%-6s -> :%s\n' "\$svc" "\$hostport" "\$target" >> "\$PORTS_FILE"
   fi
 done <<MAPPINGS
 $(while read -r svc target; do echo "$svc $target"; done <<< "$mappings")
@@ -409,21 +614,23 @@ fi
 
 cat "\$PORTS_FILE"
 
-# Health-wait via bash /dev/tcp (no nc dependency).
+# Health-wait via bash /dev/tcp (no nc dependency). Probes
+# host.docker.internal:<hostport> because we run inside claude-box.
 echo "stand-up: waiting up to \${TIMEOUT_SEC}s for ports to open..."
 while IFS= read -r line; do
-  hp=\$(echo "\$line" | awk '{print \$2}' | sed 's|^localhost:||')
+  hp=\$(echo "\$line" | awk '{print \$2}' | awk -F: '{print \$NF}')
   svc=\$(echo "\$line" | awk '{print \$1}')
   elapsed=0
-  until (echo > /dev/tcp/localhost/\$hp) 2>/dev/null; do
+  until (echo > /dev/tcp/\$HOST/\$hp) 2>/dev/null; do
     sleep 2
     elapsed=\$((elapsed + 2))
     if [[ \$elapsed -ge \$TIMEOUT_SEC ]]; then
-      echo "stand-up: \$svc localhost:\$hp didn't open in \${TIMEOUT_SEC}s" >&2
+      echo "stand-up: \$svc \$HOST:\$hp didn't open in \${TIMEOUT_SEC}s — last container log lines:" >&2
+      COMPOSE_PROJECT_NAME="$sandbox_name" docker compose -f docker-compose.yml -f "\$OVERRIDE" logs --tail 30 "\$svc" >&2 2>&1
       exit 1
     fi
   done
-  echo "stand-up:   \$svc localhost:\$hp [ready]"
+  echo "stand-up:   \$svc \$HOST:\$hp [ready]"
 done < "\$PORTS_FILE"
 
 # Project-level post-up hook (optional).
@@ -513,7 +720,14 @@ STREAM_JQ_FILTER='
         if (.is_error // false) then "     [tool error]" else "     [ok]" end
       else empty end
   elif .type == "result" then
-    "[done: \(.subtype // "?") cost=$\(.total_cost_usd // 0) duration_ms=\(.duration_ms // 0)]"
+    (.duration_ms // 0) as $ms |
+    ($ms / 1000 | floor) as $s |
+    ($s / 60 | floor) as $m |
+    ($m / 60 | floor) as $h |
+    (if $h > 0 then "\($h)h\($m - $h*60)m\($s - $m*60)s"
+     elif $m > 0 then "\($m)m\($s - $m*60)s"
+     else "\($s)s" end) as $dur |
+    "[done: \(.subtype // "?") cost=$\(.total_cost_usd // 0) took=\($dur)]"
   else empty end
 '
 
@@ -614,7 +828,15 @@ main() {
                        prompt_inline="$1"; shift ;;
       --prompt-file)   shift; [[ $# -gt 0 ]] || { echo "claude-auto: --prompt-file needs a value" >&2; exit 2; }
                        prompt_file="$1"; shift ;;
-      --stand)         STAND=1; shift ;;
+      --stand-services) shift; [[ $# -gt 0 ]] || { echo "claude-auto: --stand-services needs a value" >&2; exit 2; }
+                       IFS=',' read -ra STAND_SERVICES <<< "$1"
+                       STAND=1; STAND_MODE="explicit"; shift ;;
+      --stand-network) shift; [[ $# -gt 0 ]] || { echo "claude-auto: --stand-network needs a value" >&2; exit 2; }
+                       STAND_NETWORK="$1"; STAND=1; shift ;;
+      --stand)         STAND=1; STAND_MODE="${STAND_MODE:-app}"; shift ;;
+      --stand=*)       STAND=1; STAND_MODE="${1#--stand=}"
+                       [[ "$STAND_MODE" =~ ^(app|full)$ ]] || { echo "claude-auto: --stand=$STAND_MODE: expected 'app' or 'full'" >&2; exit 2; }
+                       shift ;;
       -h|--help)       usage; exit 0 ;;
       -*)              echo "claude-auto: unknown flag: $1" >&2; usage >&2; exit 2 ;;
       *)

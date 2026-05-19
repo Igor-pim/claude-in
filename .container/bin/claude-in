@@ -40,6 +40,21 @@ fi
 # Portable ISO-8601 UTC timestamp (GNU `date -Iseconds` is not on BSD).
 _iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
+# Run the project's per-sandbox init hook if present. The hook is for one-time
+# fix-ups specific to the project: chmoding scripts that git tracks as 100644
+# but the project needs +x to run, copying secrets, creating symlinks, etc.
+# Convention: ~/<project>/.container/sandbox-init.sh, executable, takes the
+# sandbox path as $1.
+run_sandbox_init_hook() {
+  local src="$1" dest="$2"
+  local hook="$src/.container/sandbox-init.sh"
+  [[ -x "$hook" ]] || return 0
+  echo "claude-in: running sandbox init hook: $hook" >&2
+  # Hook stdout → stderr; do_sandbox is sometimes called from contexts where
+  # bare stdout is captured (and to mirror the claude-auto fix).
+  "$hook" "$dest" >&2
+}
+
 prep_env() {
   export USER_UID
   USER_UID=$(id -u)
@@ -150,6 +165,7 @@ do_sandbox() {
     branch="claude/$name"
     base=$(git -C "$src" rev-parse --abbrev-ref HEAD)
     git -C "$src" worktree add "$dest" -b "$branch"
+    run_sandbox_init_hook "$src" "$dest"
     cat > "$META_DIR/$name.env" <<EOF
 source_repo=$src
 mode=worktree
@@ -237,12 +253,14 @@ do_sandbox_remove() {
     local dir="$SANDBOX_DIR/$name"
     local meta="$META_DIR/$name.env"
     local iso_home="$META_DIR/$name-home"
+    local auto_dir="$META_DIR/$name-auto"
 
     # Sandbox dir gone but leftovers in .meta/ — clean those up instead of bailing.
     if [[ ! -d "$dir" ]]; then
-      if [[ -f "$meta" || -d "$iso_home" ]]; then
+      if [[ -f "$meta" || -d "$iso_home" || -d "$auto_dir" ]]; then
         rm -f "$meta"
         [[ -d "$iso_home" ]] && rm -rf "$iso_home"
+        [[ -d "$auto_dir" ]] && rm -rf "$auto_dir"
         echo "removed $name (orphan meta — sandbox dir already gone)"
         dropped=$((dropped+1))
       else
@@ -272,6 +290,7 @@ do_sandbox_remove() {
         [[ -n "$branch" ]] && git -C "$source_repo" branch -D "$branch" 2>/dev/null || true
         rm -f "$meta"
         [[ -d "$iso_home" ]] && rm -rf "$iso_home"
+        [[ -d "$auto_dir" ]] && rm -rf "$auto_dir"
         echo "removed $name (worktree${branch:+, branch $branch})"
         dropped=$((dropped+1))
         continue
@@ -313,6 +332,7 @@ do_sandbox_remove() {
 
     rm -f "$meta"
     [[ -d "$iso_home" ]] && rm -rf "$iso_home"
+    [[ -d "$auto_dir" ]] && rm -rf "$auto_dir"
 
     case "$mode" in
       worktree) echo "removed $name (stale worktree${branch:+, branch $branch})" ;;
@@ -358,6 +378,7 @@ do_sandbox_prune() {
       git -C "$source_repo" branch -D "$branch" 2>/dev/null || true
       rm -f "$meta"
       [[ -d "$META_DIR/$name-home" ]] && rm -rf "$META_DIR/$name-home"
+      [[ -d "$META_DIR/$name-auto" ]] && rm -rf "$META_DIR/$name-auto"
       pruned=$((pruned+1))
     else
       echo "keep $name (branch $branch not merged into $base_branch)"
@@ -384,6 +405,17 @@ do_sandbox_prune() {
     if [[ ! -d "$SANDBOX_DIR/$iso_name" ]]; then
       echo "orphan iso-home $iso_name-home — removing"
       rm -rf "$iso_dir"
+    fi
+  done
+
+  # Clean orphan auto dirs (claude-auto run leftovers when sandbox is gone)
+  for auto_d in "$META_DIR"/*-auto; do
+    [[ -d "$auto_d" ]] || continue
+    local auto_name
+    auto_name=$(basename "$auto_d" -auto)
+    if [[ ! -d "$SANDBOX_DIR/$auto_name" ]]; then
+      echo "orphan auto-dir $auto_name-auto — removing"
+      rm -rf "$auto_d"
     fi
   done
 

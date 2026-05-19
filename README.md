@@ -329,6 +329,15 @@ claude-auto my-api --jira PROJ-1234 --prompt "Reuse the existing helper instead 
 # Long brief from a file or piped in
 claude-auto my-api --prompt-file ./task.md
 echo "Refactor X..." | claude-auto my-api --prompt-file -
+
+# With a live review stand (app-only, reuses prod DB/Redis via prod network)
+claude-auto my-api --jira PROJ-1234 --stand
+
+# Full isolated stack (own fresh DB/Redis containers)
+claude-auto my-api --jira PROJ-1234 --stand=full
+
+# Explicit service list
+claude-auto my-api --jira PROJ-1234 --stand-services php,worker
 ```
 
 What happens:
@@ -391,27 +400,43 @@ claude-in --sandbox-prune                  # bulk: remove merged sandboxes
 
 ### Live review stand (`--stand`)
 
-Add `--stand` to bring up the project's `docker-compose.yml` inside the sandbox, isolated from the production stack. The reviewer (and dev rounds 2+) get a port table in their prompt and can `curl` endpoints, `docker exec` into services, read logs — anything you'd do manually to behaviorally validate a change.
+Add `--stand` to bring up the project's app service(s) in the sandbox so the reviewer (and dev rounds 2+) can `curl` endpoints, `docker exec` into services, read logs — anything you'd do manually to behaviorally validate a change.
 
-How it works:
+#### Modes
 
-1. **Before any rounds run**, claude-auto inspects the sandbox's `docker-compose.yml` via `docker compose config --format json` and generates a per-sandbox override file (`<auto-dir>/docker-compose.review-stand.yml`) that remaps every published port to `0` (Docker assigns a free host port). This avoids collisions with the production stack on the same host.
-2. **After dev round 1**, the orchestrator runs `<auto-dir>/stand-up.sh`: `docker compose up -d` with `COMPOSE_PROJECT_NAME=<sandbox-name>`, discovers the assigned host ports via `docker compose port`, writes a port table to `<auto-dir>/stand-ports.txt`, and waits up to 60s for each port to open (bash `/dev/tcp/`). If a port doesn't open in time, the run aborts.
-3. **Per-project post-up hook (optional)**: if `~/<project>/.container/claude-auto-post-up.sh` exists and is executable, it runs after the stack is healthy and before the reviewer starts. Use it for migrations, fixtures, sanitized snapshot restore — anything the project needs to be testable.
-4. **Reviewer prompt** gets a `== Стенд ==` block with the port table and a hint about `docker compose -p <sandbox-name> exec <svc>`. Dev's round 2+ prompt gets the same block (so dev can verify fixes against running services).
-5. **Tear-down via `trap EXIT`** — the stack is always brought down (`docker compose down -v`) on PASS, FAIL, error, or Ctrl-C.
+| Flag | Brings up | DB / infra |
+| ---- | --------- | ---------- |
+| `--stand` (default = `app`)              | Only services with `build:` directive (your own images, not third-party infra). | Auto-attaches to the **running prod stack's network** so the app reaches the existing DB / Redis / MinIO / etc. |
+| `--stand=full`                           | The whole stack (services with `ports:`). | Fresh isolated containers per `COMPOSE_PROJECT_NAME`; empty data unless seeded via post-up hook. |
+| `--stand-services svc1,svc2,...`         | Explicit list. | Treated like `app` mode for network attachment. |
+| `--stand-network NAME`                   | Skips auto-detection and attaches to NAME instead. | — |
 
-Database notes — claude-auto **does not** add a DB-specific abstraction in v1. The project's `docker-compose.yml` decides:
+#### How it works
 
-- **Self-contained compose** (DB service in compose) → sandbox spins up its own DB container with an isolated volume (thanks to `COMPOSE_PROJECT_NAME`). Empty by default; load fixtures via the post-up hook if behavioral testing needs them.
-- **External DB** (project compose connects to `host.docker.internal:5432` or similar) → sandbox shares the same external DB with production. **Write tasks may corrupt production data** — be mindful.
+1. **Before any rounds**, claude-auto runs `docker compose config --format json` to inspect the sandbox's compose. Based on mode, it picks the service set (services with `build:` for `app`, all with `ports:` for `full`, or whatever you listed). Generates a per-sandbox override file (`<auto-dir>/docker-compose.review-stand.yml`) that:
+   - Remaps every published port to `0` (Docker assigns free host ports — no collisions with prod).
+   - Overrides each service's `container_name` to `<sandbox-name>_<svc>` so explicit `container_name:` directives in the project's compose don't collide with the running prod containers (common pitfall: compose puts `container_name: ${PROJECT_NAME}-redis` and Docker does NOT prefix that with `COMPOSE_PROJECT_NAME`).
+   - For non-full modes: attaches each selected service to an `external` network (the prod stack's) so DB/Redis/etc. resolve as if part of prod.
+2. **Prod-network auto-detection** for non-full modes: reads `~/<project>/.env` for `PROJECT_NAME` or `COMPOSE_PROJECT_NAME`, then looks up a Docker network labeled `com.docker.compose.project=<that>`. If found, the override yaml attaches to it. If 0 or multiple matches, prints a hint asking for `--stand-network NAME` explicitly.
+3. **After dev round 1**, the orchestrator runs `<auto-dir>/stand-up.sh`: `docker compose up -d --no-deps <selected services>` (or `up -d` for `full`), discovers host ports via `docker compose port`, writes a port table to `<auto-dir>/stand-ports.txt`, and waits up to 60s for each port to open (bash `/dev/tcp/`).
+4. **Per-project post-up hook (optional)**: if `~/<project>/.container/claude-auto-post-up.sh` exists and is executable, it runs after the stack is healthy and before the reviewer starts. Use it for migrations, fixtures, sanitized snapshot restore — anything the project needs to be testable.
+   Separately, `~/<project>/.container/sandbox-init.sh` (if executable) runs ON HOST right after `git worktree add` for any sandbox creation (not only `--stand`) with the sandbox path as `$1`. Use it for chmod'ing scripts the project needs to be `+x` but git tracks as `100644`, copying local secrets, creating symlinks, etc.
+5. **Reviewer prompt** gets a `== Стенд ==` block with the port table, hints for `docker exec` / `docker compose -p <sandbox-name> exec`, and an **explicit warning when attached to the prod network**: writes to DB/Redis go to prod data; reads are safe. Dev's round 2+ prompt gets the same block.
+6. **Tear-down via `trap EXIT`** — the stack is always brought down (`docker compose down -v`) on PASS, FAIL, error, or Ctrl-C.
 
-Caveats specific to `--stand`:
+#### Database / infra strategy
 
-- Requires git project (worktree mode). Copy-mode sandboxes (non-git projects) are rejected.
+claude-auto **doesn't** add a DB-specific abstraction. The project's `docker-compose.yml` + the mode you pick decide:
+
+- **`--stand` (app mode):** sandbox app joins the prod stack's network and talks to the same `db`/`redis`/etc. by their compose service names. Zero per-sandbox infra cost. **Writes go to prod data** — fine for read-heavy review (most code review tasks), risky for tasks that mutate persistent state. Use the warning the reviewer gets to gate writes.
+- **`--stand=full`:** isolated fresh containers for everything. Slower (~30–60s extra startup for a mariadb + opensearch + redis stack). Empty by default; load fixtures via the post-up hook if you need data.
+
+#### Caveats
+
+- Requires git project (worktree mode). Copy-mode (non-git) is rejected with a clear error.
 - v1 looks for `./docker-compose.yml` (or `compose.yaml` / `compose.yml`) in the sandbox root only. Multi-file / monorepo projects need `--stand-compose-file PATH` (planned, not in v1).
-- Port collisions: if the project's compose hardcodes ports the override successfully randomizes them, but **named volumes** are isolated by `COMPOSE_PROJECT_NAME` automatically — no per-sandbox volume conflict.
-- Resource cost: a self-contained stack with mariadb + opensearch + redis adds ~30–60s of stand-up time and several GB of RAM. Skip `--stand` for refactors or tasks that don't need behavioral validation.
+- Resource cost: `--stand=full` with a heavy stack (mariadb + opensearch + redis) adds ~30–60s of stand-up time and several GB of RAM. `--stand` (app mode) reuses prod infra — near-zero extra cost.
+- Auto-detect of the prod network depends on (a) prod stack being running and (b) `~/<project>/.env` having `PROJECT_NAME` or `COMPOSE_PROJECT_NAME`. If absent, pass `--stand-network NAME` explicitly.
 - **No DB profiles yet.** When the QA agent comes (separate role, separate prompt), expect a `--stand-profile <name>` abstraction with predefined dev/qa/snapshot lifecycle steps. v1's `--stand` is the implicit "dev" profile.
 
 ### Caveats
